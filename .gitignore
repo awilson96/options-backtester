@@ -1,0 +1,9 @@
+/build/
+/.cache/
+/.env
+/*.db
+/*.db-shm
+/*.db-wal
+*.user
+compile_commands.json
+
