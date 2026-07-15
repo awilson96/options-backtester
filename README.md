@@ -184,9 +184,47 @@ Choose **Momentum** from the chart's strategy dropdown to open its analysis
 dialog. By default it evaluates a 30-day rolling window over the latest year
 of stored data. For each trading date q, r is the first trading date on or after
 q plus the configured number of calendar days. The default window is 30 days.
-The dialog reports how often
-the close at r was greater than the close at q, along with win, loss, tie, and
-total comparison counts. The window and analysis date range are configurable.
+The skip window d controls how often a new comparison begins and defaults to one
+day; for example, d=4 makes a Monday entry next eligible on Friday. If an eligible
+date is not a trading day, the next stored trading day is used. The dialog reports
+how often the close at r was greater than the close at q, along with win, loss,
+tie, and total comparison counts. Both windows and the analysis date range are
+configurable.
+
+For d greater than one, momentum evaluates all d distinct calendar-phase starts.
+It reports the average wins, losses, ties, comparisons, and win percentage for one
+start phase rather than inflating the figures by aggregating all phases. This
+reduces the effect of an unusually lucky or unlucky initial entry date.
+
+Enable **Compare against an option strike** to replace q's stock close with a
+synthetic option-strike threshold. Strikes are multiples of the configured dollar
+width anchored at zero, so a $2.50 width produces $10.00, $12.50, $15.00, and so
+on. Offset -1 selects the first strike strictly below q, +1 the first strictly
+above q, and 0 the nearest strike; larger magnitudes move farther along the grid.
+In parametric mode the strike-offset range is studied alongside x and d, while
+the strike width remains fixed at the programmed value.
+
+Enable **Use simulated spread pricing** to provide one-contract maximum-profit and
+maximum-loss values for every studied strike offset. When negative and positive
+offsets surround zero, offset 0 pricing is the midpoint of the nearest values on
+each side. Wins add max profit, losses subtract max loss, and ties add zero. Total
+profit and percentage profit appear in parametric results; percentage profit is
+`((end value / allocation) - 1) × 100`, so break-even is 0%. Double-click a
+row to open its simulated account-value chart. A non-parametric analysis opens its
+chart immediately. Account curves and totals are averaged across skip-window start
+phases in the same way as the momentum statistics. Parametric table headers use
+**DTE**, **Skip**, and **Win Rate %**, and omit the average-ties column.
+
+Enable **Run a parametric study** to evaluate inclusive ranges for both x and d.
+The analysis dates remain fixed across every combination and are intentionally
+not parametric. Every table column supports numeric sorting by clicking its header:
+the first click sorts descending, the second ascending, and the third restores the
+original unsorted study order. Selecting another header clears the previous sort.
+Studies are limited to 10,000 parameter combinations per run. The ten combinations
+with the largest number of comparisons are highlighted in green regardless of the
+active ordering.
+Single-value DTE, Skip, and Strike Offset fields are hidden while parametric mode
+is active; their inclusive range controls take their place.
 
 The **Load Data** tab downloads IEX daily bars for a new symbol into the currently
 open database using `ALPACA_API_KEY` and `ALPACA_API_SECRET`. Its date selectors
