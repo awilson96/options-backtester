@@ -74,7 +74,8 @@ TEST_CASE("momentum simulated pricing produces profit and ending allocation perc
     REQUIRE(result.total_profit==-100);
     REQUIRE(result.ending_balance==900);
     REQUIRE(std::abs(result.profit_percentage+10)<1e-12);
-    REQUIRE(result.profit_curve.size()==2);
+    REQUIRE(result.profit_curve.size()==3);
+    REQUIRE(result.profit_curve.front().cumulative_profit==0);
     REQUIRE(result.profit_curve.back().cumulative_profit==-100);
 }
 
@@ -109,4 +110,75 @@ TEST_CASE("momentum simulated pricing applies contract slippage on selected side
             200,300,1000,0.04,0.07,options::analysis::SlippageMode::buy_and_sell});
     REQUIRE(one_side.total_profit==-108);
     REQUIRE(both_sides.total_profit==-122);
+}
+
+TEST_CASE("momentum reserves max loss and skips unfunded overlapping trades") {
+    const std::vector<options::data::Bar> bars{
+        {"TEST","2024-01-01T00:00:00Z",0,0,0,10},
+        {"TEST","2024-01-02T00:00:00Z",0,0,0,10},
+        {"TEST","2024-01-03T00:00:00Z",0,0,0,10},
+        {"TEST","2024-01-04T00:00:00Z",0,0,0,11},
+        {"TEST","2024-01-05T00:00:00Z",0,0,0,11},
+    };
+    const auto result=options::analysis::analyze_momentum(bars,3,1,std::nullopt,
+        options::analysis::SimulatedPricing{200,300,300});
+    REQUIRE(result.required_capital==600);
+    REQUIRE(result.comparisons==1);
+    REQUIRE(result.skipped_comparisons==1);
+    REQUIRE(result.wins==1);
+    REQUIRE(result.total_profit==200);
+    REQUIRE(result.ending_balance==500);
+}
+
+TEST_CASE("momentum required capital includes losses before later entries") {
+    const std::vector<options::data::Bar> bars{
+        {"TEST","2024-01-01T00:00:00Z",0,0,0,10},
+        {"TEST","2024-01-02T00:00:00Z",0,0,0,9},
+        {"TEST","2024-01-03T00:00:00Z",0,0,0,10},
+    };
+    const auto result=options::analysis::analyze_momentum(bars,1,1,std::nullopt,
+        options::analysis::SimulatedPricing{200,300,600});
+    REQUIRE(result.required_capital==600);
+    REQUIRE(result.comparisons==2);
+}
+
+TEST_CASE("momentum uses VWAP as its daily analysis price") {
+    const std::vector<options::data::Bar> bars{
+        {"TEST","2024-01-01T00:00:00Z",0,0,0,10,0,0,10},
+        {"TEST","2024-01-02T00:00:00Z",0,0,0,9,0,0,11},
+    };
+    const auto result=options::analysis::analyze_momentum(bars,1);
+    REQUIRE(result.wins==1);
+    REQUIRE(result.losses==0);
+}
+
+TEST_CASE("momentum drop rate removes unavailable trades") {
+    const std::vector<options::data::Bar> bars{
+        {"TEST","2024-01-01T00:00:00Z",0,0,0,10},
+        {"TEST","2024-01-02T00:00:00Z",0,0,0,11},
+    };
+    const auto result=options::analysis::analyze_momentum(
+        bars,1,1,std::nullopt,std::nullopt,100.0);
+    REQUIRE(result.comparisons==0);
+    REQUIRE(result.dropped_comparisons==1);
+}
+
+TEST_CASE("momentum drop scenarios select a reproducible median and retain chart bounds") {
+    const std::vector<options::data::Bar> bars{
+        {"TEST","2024-01-01T00:00:00Z",0,0,0,10},
+        {"TEST","2024-01-02T00:00:00Z",0,0,0,11},
+        {"TEST","2024-01-03T00:00:00Z",0,0,0,9},
+        {"TEST","2024-01-04T00:00:00Z",0,0,0,12},
+    };
+    const auto first=options::analysis::analyze_momentum_drop_scenarios(
+        bars,1,1,std::nullopt,options::analysis::SimulatedPricing{100,100,1000},50);
+    const auto second=options::analysis::analyze_momentum_drop_scenarios(
+        bars,1,1,std::nullopt,options::analysis::SimulatedPricing{100,100,1000},50);
+    REQUIRE(first.drop_scenario_count==5);
+    REQUIRE(first.total_profit==second.total_profit);
+    REQUIRE(!first.high_profit_curve.empty());
+    REQUIRE(!first.low_profit_curve.empty());
+    REQUIRE(!first.no_drop_profit_curve.empty());
+    REQUIRE(first.high_profit_curve.back().cumulative_profit>=first.total_profit);
+    REQUIRE(first.low_profit_curve.back().cumulative_profit<=first.total_profit);
 }

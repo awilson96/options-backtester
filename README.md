@@ -187,9 +187,32 @@ q plus the configured number of calendar days. The default window is 30 days.
 The skip window d controls how often a new comparison begins and defaults to one
 day; for example, d=4 makes a Monday entry next eligible on Friday. If an eligible
 date is not a trading day, the next stored trading day is used. The dialog reports
-how often the close at r was greater than the close at q, along with win, loss,
+how often the daily analysis price at r was greater than at q, along with win, loss,
 tie, and total comparison counts. Both windows and the analysis date range are
 configurable.
+
+Select **Save Study…** in the Momentum dialog to store a named preset. Saved
+studies appear as buttons above the chart on the **Underlying Price** page. A
+saved-study button selects its associated ticker and opens Momentum with its
+single or parametric ranges, analysis dates, strike settings, simulated pricing,
+allocation, drop rate, and slippage restored. Loading only fills the dialog; it
+does not run the analysis until **Run Analysis** or **Run Parametric Study** is
+selected. Presets use a versioned field-based format, so parameters introduced by
+future releases can use their defaults when an older study is loaded and can then
+be adjusted before running or saving again.
+
+Momentum uses each daily bar's VWAP as the analysis price, falling back to close
+only when VWAP is unavailable. **Drop rate** is a fixed, non-parametric percentage
+of otherwise eligible entries treated as unfillable. Dropped dates are selected
+using five reproducible pseudo-random symbol/date scenarios per strategy row. Table
+statistics use the scenario with median total profit. Profit charts show the high
+scenario in green, low in red, median in black, and a zero-drop baseline as a blue
+dotted line. Hovering over a profit chart displays a vertical date guide and a
+pastel-grey summary containing the date plus the no-drop, high, low, and median
+account values at that position. The underlying asset's daily analysis price is
+drawn in very light grey against a separate price axis on the right. It shares the
+chart's date axis but cannot change the account-value scale on the left. No
+additional scenario columns are added to the parametric table.
 
 For d greater than one, momentum evaluates all d distinct calendar-phase starts.
 It reports the average wins, losses, ties, comparisons, and win percentage for one
@@ -222,6 +245,14 @@ are entered as dollars per share: `$0.04` means four cents per share, or `$4` pe
 loss by its configured amount; for example, one-sided `$0.04` slippage changes
 `$200/$300` to `$196/$304`. The same slippage configuration is applied to every
 row of a parametric study.
+
+The pseudo-backtest reserves adjusted max-loss capital for every open contract.
+Overlapping entries that cannot be funded by the user's current account value are
+skipped, and only funded trades affect the table and account-value chart. **Capital
+Needed** reports the minimum starting capital that would have executed the complete
+historical schedule, including overlapping risk and the effect of earlier realized
+losses. For analyses averaged across skip phases, this is the maximum requirement
+among those phases.
 
 Enable **Run a parametric study** to evaluate inclusive ranges for both x and d.
 The analysis dates remain fixed across every combination and are intentionally
