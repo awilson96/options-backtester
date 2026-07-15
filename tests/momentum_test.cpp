@@ -94,3 +94,19 @@ TEST_CASE("momentum simulated profit is averaged across skip phases") {
     REQUIRE(result.ending_balance==1050);
     REQUIRE(std::abs(result.profit_percentage-5)<1e-12);
 }
+
+TEST_CASE("momentum simulated pricing applies contract slippage on selected sides") {
+    const std::vector<options::data::Bar> bars{
+        {"TEST","2024-01-01T00:00:00Z",0,0,0,10},
+        {"TEST","2024-01-02T00:00:00Z",0,0,0,11},
+        {"TEST","2024-01-03T00:00:00Z",0,0,0,9},
+    };
+    const auto one_side=options::analysis::analyze_momentum(bars,1,1,std::nullopt,
+        options::analysis::SimulatedPricing{
+            200,300,1000,0.04,0.07,options::analysis::SlippageMode::buy});
+    const auto both_sides=options::analysis::analyze_momentum(bars,1,1,std::nullopt,
+        options::analysis::SimulatedPricing{
+            200,300,1000,0.04,0.07,options::analysis::SlippageMode::buy_and_sell});
+    REQUIRE(one_side.total_profit==-108);
+    REQUIRE(both_sides.total_profit==-122);
+}

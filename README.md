@@ -215,6 +215,14 @@ chart immediately. Account curves and totals are averaged across skip-window sta
 phases in the same way as the momentum statistics. Parametric table headers use
 **DTE**, **Skip**, and **Win Rate %**, and omit the average-ties column.
 
+Simulated pricing also supports fixed slippage on neither side, the buy only, the
+sell only, or both buy and sell. Buy and sell slippage have independent inputs and
+are entered as dollars per share: `$0.04` means four cents per share, or `$4` per
+100-share option contract. Each enabled side reduces max profit and increases max
+loss by its configured amount; for example, one-sided `$0.04` slippage changes
+`$200/$300` to `$196/$304`. The same slippage configuration is applied to every
+row of a parametric study.
+
 Enable **Run a parametric study** to evaluate inclusive ranges for both x and d.
 The analysis dates remain fixed across every combination and are intentionally
 not parametric. Every table column supports numeric sorting by clicking its header:

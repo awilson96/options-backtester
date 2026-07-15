@@ -27,6 +27,17 @@ double comparison_price(double underlying,const std::optional<StrikeAdjustment>&
     return std::round(units)*adjustment->width;
 }
 
+double slippage_cost(const SimulatedPricing& pricing) {
+    double result=0;
+    if(pricing.slippage_mode==SlippageMode::buy ||
+       pricing.slippage_mode==SlippageMode::buy_and_sell)
+        result+=pricing.buy_slippage_per_share*100.0;
+    if(pricing.slippage_mode==SlippageMode::sell ||
+       pricing.slippage_mode==SlippageMode::buy_and_sell)
+        result+=pricing.sell_slippage_per_share*100.0;
+    return result;
+}
+
 }  // namespace
 
 MomentumResult analyze_momentum(
@@ -40,7 +51,10 @@ MomentumResult analyze_momentum(
     if(simulated_pricing && (!std::isfinite(simulated_pricing->max_profit) ||
        !std::isfinite(simulated_pricing->max_loss) || simulated_pricing->max_profit<0 ||
        simulated_pricing->max_loss<=0 || !std::isfinite(simulated_pricing->allocation) ||
-       simulated_pricing->allocation<=0))
+       simulated_pricing->allocation<=0 ||
+       !std::isfinite(simulated_pricing->buy_slippage_per_share) ||
+       !std::isfinite(simulated_pricing->sell_slippage_per_share) ||
+       simulated_pricing->buy_slippage_per_share<0 || simulated_pricing->sell_slippage_per_share<0))
         throw std::invalid_argument(
             "simulated max profit must be non-negative; max loss and allocation must be positive");
 
@@ -65,6 +79,7 @@ MomentumResult analyze_momentum(
 
     MomentumResult result;
     std::map<QDate,double> profit_changes;
+    const auto friction=simulated_pricing ? slippage_cost(*simulated_pricing) : 0.0;
     for(std::size_t phase=0;phase<skip_days;++phase) {
         MomentumResult phase_result;
         auto next_eligible_date=observations.front().date.addDays(static_cast<qint64>(phase));
@@ -77,10 +92,10 @@ MomentumResult analyze_momentum(
             double profit=0;
             if(right.close>threshold) {
                 ++phase_result.wins;
-                if(simulated_pricing) profit=simulated_pricing->max_profit;
+                if(simulated_pricing) profit=simulated_pricing->max_profit-friction;
             } else if(right.close<threshold) {
                 ++phase_result.losses;
-                if(simulated_pricing) profit=-simulated_pricing->max_loss;
+                if(simulated_pricing) profit=-(simulated_pricing->max_loss+friction);
             } else {
                 ++phase_result.ties;
             }

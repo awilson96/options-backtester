@@ -456,6 +456,22 @@ private:
         allocation->setValue(10000.0);
         allocation->setPrefix("$");
         allocation->setEnabled(false);
+        auto* slippage_mode=new QComboBox;
+        slippage_mode->addItems({"None","Sell only","Buy only","Buy and sell"});
+        slippage_mode->setEnabled(false);
+        const auto slippage_box=[] {
+            auto* box=new QDoubleSpinBox;
+            box->setRange(0.0,1000.0);
+            box->setDecimals(4);
+            box->setSingleStep(0.01);
+            box->setValue(0.04);
+            box->setPrefix("$");
+            box->setSuffix(" per share");
+            box->setEnabled(false);
+            return box;
+        };
+        auto* buy_slippage=slippage_box();
+        auto* sell_slippage=slippage_box();
         auto* analysis_start=new QDateEdit(qMax(available_start_,available_end_.addYears(-1)));
         auto* analysis_end=new QDateEdit(available_end_);
         analysis_start->setCalendarPopup(true); analysis_end->setCalendarPopup(true);
@@ -473,6 +489,9 @@ private:
         controls->addRow(strike_offset_label,strike_offset);
         controls->addRow("Pseudo-backtest",simulated_pricing);
         controls->addRow("Trading allocation",allocation);
+        controls->addRow("Slippage sides",slippage_mode);
+        controls->addRow("Buy slippage",buy_slippage);
+        controls->addRow("Sell slippage",sell_slippage);
         controls->addRow("Analysis start",analysis_start);
         controls->addRow("Analysis end",analysis_end);
         layout->addLayout(controls);
@@ -604,6 +623,14 @@ private:
             pricing_editor->set_offsets(std::move(offsets));
             pricing_editor->setVisible(true);
         };
+        const auto selected_slippage_mode=[=] {
+            switch(slippage_mode->currentIndex()) {
+            case 1: return options::analysis::SlippageMode::sell;
+            case 2: return options::analysis::SlippageMode::buy;
+            case 3: return options::analysis::SlippageMode::buy_and_sell;
+            default: return options::analysis::SlippageMode::none;
+            }
+        };
 
         connect(parametric,&QCheckBox::toggled,&dialog,[=](bool enabled) {
             window_days_label->setVisible(!enabled);
@@ -632,9 +659,18 @@ private:
         });
         connect(simulated_pricing,&QCheckBox::toggled,&dialog,[=](bool enabled) {
             allocation->setEnabled(enabled);
+            slippage_mode->setEnabled(enabled);
+            buy_slippage->setEnabled(enabled &&
+                (slippage_mode->currentIndex()==2 || slippage_mode->currentIndex()==3));
+            sell_slippage->setEnabled(enabled &&
+                (slippage_mode->currentIndex()==1 || slippage_mode->currentIndex()==3));
             study_table->setColumnHidden(8,!enabled);
             study_table->setColumnHidden(9,!enabled);
             rebuild_pricing();
+        });
+        connect(slippage_mode,&QComboBox::currentIndexChanged,&dialog,[=](int index) {
+            buy_slippage->setEnabled(simulated_pricing->isChecked() && (index==2 || index==3));
+            sell_slippage->setEnabled(simulated_pricing->isChecked() && (index==1 || index==3));
         });
         connect(strike_offset,&QSpinBox::valueChanged,&dialog,[=](int) { rebuild_pricing(); });
         connect(strike_minimum,&QSpinBox::valueChanged,&dialog,[=](int) { rebuild_pricing(); });
@@ -679,7 +715,12 @@ private:
                                     adjustment=options::analysis::StrikeAdjustment{strike_width->value(),offset};
                                 std::optional<options::analysis::SimulatedPricing> pricing;
                                 if(simulated_pricing->isChecked()) pricing=pricing_editor->pricing_for(offset);
-                                if(pricing) pricing->allocation=allocation->value();
+                                if(pricing) {
+                                    pricing->allocation=allocation->value();
+                                    pricing->buy_slippage_per_share=buy_slippage->value();
+                                    pricing->sell_slippage_per_share=sell_slippage->value();
+                                    pricing->slippage_mode=selected_slippage_mode();
+                                }
                                 if(simulated_pricing->isChecked() && !pricing) {
                                     analysis_status->setText(
                                         "Simulated pricing is missing for strike offset "+QString::number(offset)+".");
@@ -741,7 +782,12 @@ private:
                         strike_width->value(),strike_offset->value()};
                 std::optional<options::analysis::SimulatedPricing> pricing;
                 if(simulated_pricing->isChecked()) pricing=pricing_editor->pricing_for(strike_offset->value());
-                if(pricing) pricing->allocation=allocation->value();
+                if(pricing) {
+                    pricing->allocation=allocation->value();
+                    pricing->buy_slippage_per_share=buy_slippage->value();
+                    pricing->sell_slippage_per_share=sell_slippage->value();
+                    pricing->slippage_mode=selected_slippage_mode();
+                }
                 if(simulated_pricing->isChecked() && !pricing) {
                     analysis_status->setText("Simulated pricing is missing for this strike offset.");
                     return;

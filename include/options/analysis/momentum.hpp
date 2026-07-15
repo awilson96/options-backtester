@@ -32,10 +32,20 @@ struct StrikeAdjustment {
     int offset{};
 };
 
+enum class SlippageMode {
+    none,
+    buy,
+    sell,
+    buy_and_sell,
+};
+
 struct SimulatedPricing {
     double max_profit{};
     double max_loss{};
     double allocation{};
+    double buy_slippage_per_share{};
+    double sell_slippage_per_share{};
+    SlippageMode slippage_mode{SlippageMode::none};
 };
 
 [[nodiscard]] MomentumResult analyze_momentum(
