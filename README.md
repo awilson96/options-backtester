@@ -173,16 +173,7 @@ Launch the native Qt viewer without command-line options:
 ```
 
 The viewer opens `market-data.db` automatically when launched from the repository
-and remembers the last database selected with **Open Database**. It discovers
-stored underlyings, option feeds, and snapshot date ranges. Strategy parameters,
-equity feed, dates, and starting cash are selected in the window before pressing
-**Run Backtest**.
-
-The results plot shows normalized strategy and underlying buy-and-hold equity
-curves. The viewer also shows headline return and drawdown metrics and renders
-the option trade ledger with ask entries, bid exits, and realized P&L.
-
-The **Underlying Price** tab has independent symbol, feed, and date selectors
-populated from stored daily equity bars. Switching symbols updates its available
-range and chart. Press **Plot Underlying** to chart daily closes without running
-an options backtest; the time axis ends at the selected symbol's final stored bar.
+and remembers the last database selected with **Open Database**. Its symbol and
+date selectors are populated from stored IEX daily equity bars. Switching symbols
+or changing either date updates the chart. Hold **Ctrl** while scrolling over the
+chart to move the selected date window left or right along the available timeline.
