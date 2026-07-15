@@ -175,5 +175,7 @@ Launch the native Qt viewer without command-line options:
 The viewer opens `market-data.db` automatically when launched from the repository
 and remembers the last database selected with **Open Database**. Its symbol and
 date selectors are populated from stored IEX daily equity bars. Switching symbols
-or changing either date updates the chart. Hold **Ctrl** while scrolling over the
-chart to move the selected date window left or right along the available timeline.
+or changing either date updates the chart, and each symbol's selected date range
+is restored between sessions. Hold **Ctrl** while scrolling over the chart to move
+the selected date window left or right along the available timeline. Every five
+consecutive scroll events in one direction moves it by one step.

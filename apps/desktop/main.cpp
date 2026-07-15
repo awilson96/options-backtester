@@ -50,7 +50,17 @@ protected:
         if(event->modifiers().testFlag(Qt::ControlModifier)) {
             const auto delta=event->angleDelta().y()!=0 ? event->angleDelta().y()
                                                        : event->angleDelta().x();
-            if(delta!=0) shift_window_(delta>0 ? -1 : 1);
+            if(delta!=0) {
+                const auto direction=delta>0 ? -1 : 1;
+                if(direction!=pending_direction_) {
+                    pending_direction_=direction;
+                    pending_events_=0;
+                }
+                if(++pending_events_==5) {
+                    shift_window_(direction);
+                    pending_events_=0;
+                }
+            }
             event->accept();
             return;
         }
@@ -59,6 +69,8 @@ protected:
 
 private:
     std::function<void(int)> shift_window_;
+    int pending_direction_{};
+    int pending_events_{};
 };
 
 class ResultsWindow final : public QMainWindow {
@@ -69,14 +81,7 @@ public:
         auto* central=new QWidget;
         auto* page=new QVBoxLayout(central);
 
-        auto* database_row=new QHBoxLayout;
-        database_label_=new QLabel;
         auto* open_button=new QPushButton("Open Database…");
-        database_row->addWidget(new QLabel("Database:"));
-        database_row->addWidget(database_label_,1);
-        database_row->addWidget(open_button);
-        page->addLayout(database_row);
-
         auto* stock_page=new QWidget;
         auto* stock_layout=new QVBoxLayout(stock_page);
         auto* stock_controls=new QHBoxLayout;
@@ -87,19 +92,18 @@ public:
         stock_controls->addWidget(new QLabel("Start:")); stock_controls->addWidget(stock_start_);
         stock_controls->addWidget(new QLabel("End:")); stock_controls->addWidget(stock_end_);
         stock_controls->addStretch();
+        stock_controls->addWidget(open_button);
         stock_layout->addLayout(stock_controls);
         stock_chart_view_=new TimelineChartView([this](int direction){ shift_date_window(direction); });
         stock_chart_view_->setRenderHint(QPainter::Antialiasing);
         stock_layout->addWidget(stock_chart_view_,1);
-        stock_status_=new QLabel("Select an underlying with stored equity bars.");
-        stock_layout->addWidget(stock_status_);
         page->addWidget(stock_page,1);
         setCentralWidget(central);
 
         connect(open_button,&QPushButton::clicked,this,[this]{ choose_database(); });
         connect(stock_symbol_,&QComboBox::currentTextChanged,this,[this]{ update_stock_range(); });
-        connect(stock_start_,&QDateEdit::dateChanged,this,[this]{ plot_underlying(); });
-        connect(stock_end_,&QDateEdit::dateChanged,this,[this]{ plot_underlying(); });
+        connect(stock_start_,&QDateEdit::dateChanged,this,[this]{ persist_dates(); plot_underlying(); });
+        connect(stock_end_,&QDateEdit::dateChanged,this,[this]{ persist_dates(); plot_underlying(); });
         open_database(initial_database_path());
     }
 
@@ -115,7 +119,6 @@ private:
             database_path_=QFileInfo(path).absoluteFilePath();
             bar_store_=std::make_unique<options::data::SqliteBarStore>(database_path_.toStdString());
             QSettings("OptionsBacktester","OptionsBacktester").setValue("database",database_path_);
-            database_label_->setText(database_path_);
             load_stock_symbols();
         } catch(const std::exception& error) {
             QMessageBox::critical(this,"Open Database",error.what());
@@ -131,7 +134,6 @@ private:
         const auto last=QDate::fromString(QString::fromStdString(range.end),Qt::ISODate);
         const bool available=first.isValid() && last.isValid();
         if(!available) {
-            stock_status_->setText("No iex daily bars are stored for "+stock_symbol_->currentText()+".");
             return;
         }
         available_start_=first;
@@ -139,7 +141,20 @@ private:
         const QSignalBlocker block_start(stock_start_);
         const QSignalBlocker block_end(stock_end_);
         stock_start_->setDateRange(first,last); stock_end_->setDateRange(first,last);
-        stock_start_->setDate(first); stock_end_->setDate(last);
+        auto selected_start=first;
+        auto selected_end=last;
+        QSettings settings("OptionsBacktester","OptionsBacktester");
+        settings.beginGroup("underlying_price");
+        settings.beginGroup(stock_symbol_->currentText());
+        const auto saved_start=QDate::fromString(settings.value("start_date").toString(),Qt::ISODate);
+        const auto saved_end=QDate::fromString(settings.value("end_date").toString(),Qt::ISODate);
+        if(saved_start.isValid()) selected_start=qBound(first,saved_start,last);
+        if(saved_end.isValid()) selected_end=qBound(first,saved_end,last);
+        if(selected_start>selected_end) {
+            selected_start=first;
+            selected_end=last;
+        }
+        stock_start_->setDate(selected_start); stock_end_->setDate(selected_end);
         plot_underlying();
     }
 
@@ -154,7 +169,6 @@ private:
         if(previous_index>=0) stock_symbol_->setCurrentIndex(previous_index);
         stock_symbol_->blockSignals(false);
         if(stock_symbol_->count()==0) {
-            stock_status_->setText("No iex daily bars are stored.");
             return;
         }
         update_stock_range();
@@ -175,7 +189,17 @@ private:
         const QSignalBlocker block_end(stock_end_);
         stock_start_->setDate(start.addDays(shift));
         stock_end_->setDate(end.addDays(shift));
+        persist_dates();
         plot_underlying();
+    }
+
+    void persist_dates() const {
+        if(stock_symbol_->currentText().isEmpty()) return;
+        QSettings settings("OptionsBacktester","OptionsBacktester");
+        settings.beginGroup("underlying_price");
+        settings.beginGroup(stock_symbol_->currentText());
+        settings.setValue("start_date",stock_start_->date().toString(Qt::ISODate));
+        settings.setValue("end_date",stock_end_->date().toString(Qt::ISODate));
     }
 
     void plot_underlying() {
@@ -205,21 +229,17 @@ private:
             chart->addAxis(dates,Qt::AlignBottom); chart->addAxis(values,Qt::AlignLeft);
             prices->attachAxis(dates); prices->attachAxis(values);
             stock_chart_view_->setChart(chart);
-            stock_status_->setText("Plotted "+QString::number(bars.size())+" daily bars from "+
-                stock_start_->date().toString(Qt::ISODate)+" through "+stock_end_->date().toString(Qt::ISODate)+".");
         } catch(const std::exception& error) {
-            stock_status_->setText("Plot failed: "+QString::fromUtf8(error.what()));
+            Q_UNUSED(error);
         }
     }
 
     QString database_path_;
     std::unique_ptr<options::data::SqliteBarStore> bar_store_;
-    QLabel* database_label_{};
     QComboBox* stock_symbol_{};
     QDateEdit *stock_start_{},*stock_end_{};
     QDate available_start_,available_end_;
     TimelineChartView* stock_chart_view_{};
-    QLabel* stock_status_{};
 };
 
 }  // namespace
