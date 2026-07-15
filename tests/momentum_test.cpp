@@ -6,10 +6,10 @@
 TEST_CASE("momentum analysis counts rolling wins losses and ties") {
     const std::vector<options::data::Bar> bars{
         {"TEST","2024-01-01T00:00:00Z",0,0,0,10},
-        {"TEST","2024-02-01T00:00:00Z",0,0,0,12},
-        {"TEST","2024-03-01T00:00:00Z",0,0,0,11},
-        {"TEST","2024-04-01T00:00:00Z",0,0,0,11},
-        {"TEST","2024-05-01T00:00:00Z",0,0,0,13},
+        {"TEST","2024-01-02T00:00:00Z",0,0,0,12},
+        {"TEST","2024-01-03T00:00:00Z",0,0,0,11},
+        {"TEST","2024-01-04T00:00:00Z",0,0,0,11},
+        {"TEST","2024-01-05T00:00:00Z",0,0,0,13},
     };
     const auto result=options::analysis::analyze_momentum(bars,1);
     REQUIRE(result.comparisons==4);
@@ -21,8 +21,8 @@ TEST_CASE("momentum analysis counts rolling wins losses and ties") {
 
 TEST_CASE("momentum analysis uses the first trading day after the target date") {
     const std::vector<options::data::Bar> bars{
-        {"TEST","2024-01-30T00:00:00Z",0,0,0,10},
-        {"TEST","2024-03-01T00:00:00Z",0,0,0,12},
+        {"TEST","2024-01-05T00:00:00Z",0,0,0,10},
+        {"TEST","2024-01-08T00:00:00Z",0,0,0,12},
     };
     const auto result=options::analysis::analyze_momentum(bars,1);
     REQUIRE(result.comparisons==1);

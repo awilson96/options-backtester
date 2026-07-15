@@ -16,6 +16,6 @@ struct MomentumResult {
 };
 
 [[nodiscard]] MomentumResult analyze_momentum(
-    std::span<const data::Bar> bars, std::size_t window_months);
+    std::span<const data::Bar> bars, std::size_t window_days);
 
 }  // namespace options::analysis

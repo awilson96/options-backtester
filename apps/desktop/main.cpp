@@ -277,22 +277,22 @@ private:
         auto* layout=new QVBoxLayout(&dialog);
         auto* description=new QLabel(
             "For each trading-day close q, this compares the close at the first trading day "
-            "on or after q plus the selected window.");
+            "on or after q plus the selected number of calendar days.");
         description->setWordWrap(true);
         layout->addWidget(description);
 
         auto* controls=new QFormLayout;
-        auto* window_months=new QSpinBox;
-        window_months->setRange(1,120);
-        window_months->setValue(1);
-        window_months->setSuffix(" month(s)");
+        auto* window_days=new QSpinBox;
+        window_days->setRange(1,3650);
+        window_days->setValue(30);
+        window_days->setSuffix(" day(s)");
         auto* analysis_start=new QDateEdit(qMax(available_start_,available_end_.addYears(-1)));
         auto* analysis_end=new QDateEdit(available_end_);
         analysis_start->setCalendarPopup(true); analysis_end->setCalendarPopup(true);
         analysis_start->setDateRange(available_start_,available_end_);
         analysis_end->setDateRange(available_start_,available_end_);
         controls->addRow("Ticker",new QLabel(symbol));
-        controls->addRow("Comparison window (x)",window_months);
+        controls->addRow("Comparison window (x)",window_days);
         controls->addRow("Analysis start",analysis_start);
         controls->addRow("Analysis end",analysis_end);
         layout->addLayout(controls);
@@ -326,7 +326,7 @@ private:
                     analysis_start->date().toString(Qt::ISODate).toStdString(),
                     analysis_end->date().toString(Qt::ISODate).toStdString()});
                 const auto result=options::analysis::analyze_momentum(
-                    bars,static_cast<std::size_t>(window_months->value()));
+                    bars,static_cast<std::size_t>(window_days->value()));
                 win_percentage->setText(QString::number(result.win_percentage,'f',2)+"%");
                 wins->setText(QString::number(result.wins));
                 losses->setText(QString::number(result.losses));

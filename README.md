@@ -181,9 +181,10 @@ the selected date window left or right along the available timeline. Every five
 consecutive scroll events in one direction moves it by one step.
 
 Choose **Momentum** from the chart's strategy dropdown to open its analysis
-dialog. By default it evaluates a one-month rolling window over the latest year
+dialog. By default it evaluates a 30-day rolling window over the latest year
 of stored data. For each trading date q, r is the first trading date on or after
-q plus the configured number of calendar months. The dialog reports how often
+q plus the configured number of calendar days. The default window is 30 days.
+The dialog reports how often
 the close at r was greater than the close at q, along with win, loss, tie, and
 total comparison counts. The window and analysis date range are configurable.
 

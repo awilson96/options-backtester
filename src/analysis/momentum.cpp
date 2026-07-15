@@ -16,8 +16,8 @@ struct Observation {
 
 }  // namespace
 
-MomentumResult analyze_momentum(std::span<const data::Bar> bars, std::size_t window_months) {
-    if(window_months==0) throw std::invalid_argument("momentum window must be at least one month");
+MomentumResult analyze_momentum(std::span<const data::Bar> bars, std::size_t window_days) {
+    if(window_days==0) throw std::invalid_argument("momentum window must be at least one day");
 
     std::vector<Observation> observations;
     observations.reserve(bars.size());
@@ -29,7 +29,7 @@ MomentumResult analyze_momentum(std::span<const data::Bar> bars, std::size_t win
 
     MomentumResult result;
     for(auto left=observations.begin();left!=observations.end();++left) {
-        const auto target=left->date.addMonths(static_cast<int>(window_months));
+        const auto target=left->date.addDays(static_cast<qint64>(window_days));
         const auto right=std::lower_bound(std::next(left),observations.end(),target,
             [](const Observation& observation,const QDate& date){return observation.date<date;});
         if(right==observations.end()) continue;
