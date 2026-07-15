@@ -1,3 +1,4 @@
+#include "options/analysis/momentum.hpp"
 #include "options/data/sqlite_bar_store.hpp"
 #include "options/providers/alpaca/alpaca_client.hpp"
 
@@ -7,8 +8,10 @@
 #include <QComboBox>
 #include <QDateEdit>
 #include <QDateTimeAxis>
+#include <QDialog>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFormLayout>
 #include <QFutureWatcher>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -20,6 +23,7 @@
 #include <QPushButton>
 #include <QSettings>
 #include <QSignalBlocker>
+#include <QSpinBox>
 #include <QTabWidget>
 #include <QValueAxis>
 #include <QVBoxLayout>
@@ -108,11 +112,14 @@ public:
         auto* stock_layout=new QVBoxLayout(stock_page);
         auto* stock_controls=new QHBoxLayout;
         stock_symbol_=new QComboBox;
+        strategy_=new QComboBox;
+        strategy_->addItems({"Select strategy…","Momentum"});
         stock_start_=new QDateEdit; stock_end_=new QDateEdit;
         stock_start_->setCalendarPopup(true); stock_end_->setCalendarPopup(true);
         stock_controls->addWidget(new QLabel("Symbol:")); stock_controls->addWidget(stock_symbol_);
         stock_controls->addWidget(new QLabel("Start:")); stock_controls->addWidget(stock_start_);
         stock_controls->addWidget(new QLabel("End:")); stock_controls->addWidget(stock_end_);
+        stock_controls->addWidget(new QLabel("Strategy:")); stock_controls->addWidget(strategy_);
         stock_controls->addStretch();
         stock_controls->addWidget(open_button);
         stock_layout->addLayout(stock_controls);
@@ -151,6 +158,10 @@ public:
         connect(stock_symbol_,&QComboBox::currentTextChanged,this,[this]{ update_stock_range(); });
         connect(stock_start_,&QDateEdit::dateChanged,this,[this]{ persist_dates(); plot_underlying(); });
         connect(stock_end_,&QDateEdit::dateChanged,this,[this]{ persist_dates(); plot_underlying(); });
+        connect(strategy_,&QComboBox::activated,this,[this](int index){
+            if(index==1) show_momentum_analysis();
+            strategy_->setCurrentIndex(0);
+        });
         connect(load_button_,&QPushButton::clicked,this,[this]{ load_symbol_data(); });
         connect(load_symbol_,&QLineEdit::returnPressed,this,[this]{ load_symbol_data(); });
         load_watcher_=new QFutureWatcher<LoadResult>(this);
@@ -251,6 +262,86 @@ private:
         settings.beginGroup(stock_symbol_->currentText());
         settings.setValue("start_date",stock_start_->date().toString(Qt::ISODate));
         settings.setValue("end_date",stock_end_->date().toString(Qt::ISODate));
+    }
+
+    void show_momentum_analysis() {
+        const auto symbol=stock_symbol_->currentText();
+        if(symbol.isEmpty() || !available_start_.isValid() || !available_end_.isValid()) {
+            QMessageBox::information(this,"Momentum Analysis","Select a symbol with stored daily bars first.");
+            return;
+        }
+
+        QDialog dialog(this);
+        dialog.setWindowTitle("Momentum Analysis — "+symbol);
+        dialog.resize(520,360);
+        auto* layout=new QVBoxLayout(&dialog);
+        auto* description=new QLabel(
+            "For each trading-day close q, this compares the close at the first trading day "
+            "on or after q plus the selected window.");
+        description->setWordWrap(true);
+        layout->addWidget(description);
+
+        auto* controls=new QFormLayout;
+        auto* window_months=new QSpinBox;
+        window_months->setRange(1,120);
+        window_months->setValue(1);
+        window_months->setSuffix(" month(s)");
+        auto* analysis_start=new QDateEdit(qMax(available_start_,available_end_.addYears(-1)));
+        auto* analysis_end=new QDateEdit(available_end_);
+        analysis_start->setCalendarPopup(true); analysis_end->setCalendarPopup(true);
+        analysis_start->setDateRange(available_start_,available_end_);
+        analysis_end->setDateRange(available_start_,available_end_);
+        controls->addRow("Ticker",new QLabel(symbol));
+        controls->addRow("Comparison window (x)",window_months);
+        controls->addRow("Analysis start",analysis_start);
+        controls->addRow("Analysis end",analysis_end);
+        layout->addLayout(controls);
+
+        auto* results=new QFormLayout;
+        auto* win_percentage=new QLabel("—");
+        auto* wins=new QLabel("—");
+        auto* losses=new QLabel("—");
+        auto* ties=new QLabel("—");
+        auto* comparisons=new QLabel("—");
+        results->addRow("Price greater at r",win_percentage);
+        results->addRow("Wins",wins);
+        results->addRow("Losses",losses);
+        results->addRow("Ties",ties);
+        results->addRow("Total comparisons",comparisons);
+        layout->addLayout(results);
+
+        auto* analysis_status=new QLabel;
+        analysis_status->setWordWrap(true);
+        layout->addWidget(analysis_status);
+        auto* analyze_button=new QPushButton("Run Analysis");
+        layout->addWidget(analyze_button,0,Qt::AlignRight);
+
+        const auto analyze=[&,symbol] {
+            if(analysis_start->date()>analysis_end->date()) {
+                analysis_status->setText("The analysis start must not be after the end.");
+                return;
+            }
+            try {
+                const auto bars=bar_store_->load({symbol.toStdString(),"alpaca","iex","1Day","all",
+                    analysis_start->date().toString(Qt::ISODate).toStdString(),
+                    analysis_end->date().toString(Qt::ISODate).toStdString()});
+                const auto result=options::analysis::analyze_momentum(
+                    bars,static_cast<std::size_t>(window_months->value()));
+                win_percentage->setText(QString::number(result.win_percentage,'f',2)+"%");
+                wins->setText(QString::number(result.wins));
+                losses->setText(QString::number(result.losses));
+                ties->setText(QString::number(result.ties));
+                comparisons->setText(QString::number(result.comparisons));
+                analysis_status->setText(result.comparisons==0
+                    ? "The selected analysis range is too short for this comparison window."
+                    : QString());
+            } catch(const std::exception& error) {
+                analysis_status->setText("Analysis failed: "+QString::fromUtf8(error.what()));
+            }
+        };
+        connect(analyze_button,&QPushButton::clicked,&dialog,analyze);
+        analyze();
+        dialog.exec();
     }
 
     void load_symbol_data() {
@@ -362,7 +453,7 @@ private:
 
     QString database_path_;
     std::unique_ptr<options::data::SqliteBarStore> bar_store_;
-    QComboBox* stock_symbol_{};
+    QComboBox *stock_symbol_{},*strategy_{};
     QDateEdit *stock_start_{},*stock_end_{};
     QDate available_start_,available_end_;
     TimelineChartView* stock_chart_view_{};

@@ -41,11 +41,21 @@ target_compile_options(options_backtest PRIVATE
     $<$<BOOL:${OPTIONS_BACKTESTER_WARNINGS_AS_ERRORS}>:-Werror>
 )
 
+add_library(options_analysis
+    src/analysis/momentum.cpp
+)
+target_include_directories(options_analysis PUBLIC include)
+target_link_libraries(options_analysis PUBLIC options_data)
+target_compile_options(options_analysis PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall;-Wextra;-Wpedantic>
+    $<$<BOOL:${OPTIONS_BACKTESTER_WARNINGS_AS_ERRORS}>:-Werror>
+)
+
 add_executable(options-backtester apps/cli/main.cpp)
 target_link_libraries(options-backtester PRIVATE options_data options_backtest)
 
 add_executable(options-viewer apps/desktop/main.cpp)
-target_link_libraries(options-viewer PRIVATE options_data Qt6::Widgets Qt6::Charts Qt6::Concurrent)
+target_link_libraries(options-viewer PRIVATE options_data options_analysis Qt6::Widgets Qt6::Charts Qt6::Concurrent)
 
 if(BUILD_TESTING)
     add_executable(options_data_tests
@@ -54,10 +64,11 @@ if(BUILD_TESTING)
         tests/bar_validation_test.cpp
         tests/equity_backtest_test.cpp
         tests/long_call_backtest_test.cpp
+        tests/momentum_test.cpp
         tests/option_json_test.cpp
         tests/sqlite_option_store_test.cpp
         tests/sqlite_bar_store_test.cpp
     )
-    target_link_libraries(options_data_tests PRIVATE options_data options_backtest)
+    target_link_libraries(options_data_tests PRIVATE options_data options_backtest options_analysis)
     add_test(NAME options_data_tests COMMAND options_data_tests)
 endif()
