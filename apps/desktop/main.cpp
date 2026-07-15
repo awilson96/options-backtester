@@ -1,4 +1,5 @@
 #include "options/data/sqlite_bar_store.hpp"
+#include "options/providers/alpaca/alpaca_client.hpp"
 
 #include <QApplication>
 #include <QChart>
@@ -8,8 +9,10 @@
 #include <QDateTimeAxis>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFutureWatcher>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QLineEdit>
 #include <QLineSeries>
 #include <QMainWindow>
 #include <QMessageBox>
@@ -17,10 +20,13 @@
 #include <QPushButton>
 #include <QSettings>
 #include <QSignalBlocker>
+#include <QTabWidget>
 #include <QValueAxis>
 #include <QVBoxLayout>
 #include <QWheelEvent>
+#include <QtConcurrentRun>
 
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -28,6 +34,21 @@
 #include <string>
 
 namespace {
+
+struct LoadResult {
+    QString symbol;
+    QString database_path;
+    std::size_t downloaded{};
+    bool cached{};
+    QString error;
+};
+
+std::string environment(const char* name) {
+    const auto* value=std::getenv(name);
+    if(!value || !*value) throw std::runtime_error(QString("Missing environment variable: "+
+        QString::fromUtf8(name)).toStdString());
+    return value;
+}
 
 QString initial_database_path() {
     QSettings settings("OptionsBacktester","OptionsBacktester");
@@ -82,6 +103,7 @@ public:
         auto* page=new QVBoxLayout(central);
 
         auto* open_button=new QPushButton("Open Database…");
+        auto* tabs=new QTabWidget;
         auto* stock_page=new QWidget;
         auto* stock_layout=new QVBoxLayout(stock_page);
         auto* stock_controls=new QHBoxLayout;
@@ -97,13 +119,42 @@ public:
         stock_chart_view_=new TimelineChartView([this](int direction){ shift_date_window(direction); });
         stock_chart_view_->setRenderHint(QPainter::Antialiasing);
         stock_layout->addWidget(stock_chart_view_,1);
-        page->addWidget(stock_page,1);
+        tabs->addTab(stock_page,"Underlying Price");
+
+        auto* load_page=new QWidget;
+        auto* load_layout=new QVBoxLayout(load_page);
+        auto* load_controls=new QHBoxLayout;
+        load_symbol_=new QLineEdit;
+        load_symbol_->setPlaceholderText("e.g. AAPL");
+        load_symbol_->setMaximumWidth(160);
+        load_start_=new QDateEdit(QDate(1970,1,1));
+        load_end_=new QDateEdit(QDate::currentDate());
+        load_start_->setCalendarPopup(true); load_end_->setCalendarPopup(true);
+        load_start_->setDateRange(QDate(1970,1,1),QDate::currentDate());
+        load_end_->setDateRange(QDate(1970,1,1),QDate::currentDate());
+        load_button_=new QPushButton("Load Data");
+        load_controls->addWidget(new QLabel("Symbol:")); load_controls->addWidget(load_symbol_);
+        load_controls->addWidget(new QLabel("Start:")); load_controls->addWidget(load_start_);
+        load_controls->addWidget(new QLabel("End:")); load_controls->addWidget(load_end_);
+        load_controls->addWidget(load_button_); load_controls->addStretch();
+        load_layout->addLayout(load_controls);
+        load_status_=new QLabel("Enter a symbol to load its available Alpaca IEX daily history.");
+        load_status_->setWordWrap(true);
+        load_layout->addWidget(load_status_);
+        load_layout->addStretch();
+        tabs->addTab(load_page,"Load Data");
+
+        page->addWidget(tabs,1);
         setCentralWidget(central);
 
         connect(open_button,&QPushButton::clicked,this,[this]{ choose_database(); });
         connect(stock_symbol_,&QComboBox::currentTextChanged,this,[this]{ update_stock_range(); });
         connect(stock_start_,&QDateEdit::dateChanged,this,[this]{ persist_dates(); plot_underlying(); });
         connect(stock_end_,&QDateEdit::dateChanged,this,[this]{ persist_dates(); plot_underlying(); });
+        connect(load_button_,&QPushButton::clicked,this,[this]{ load_symbol_data(); });
+        connect(load_symbol_,&QLineEdit::returnPressed,this,[this]{ load_symbol_data(); });
+        load_watcher_=new QFutureWatcher<LoadResult>(this);
+        connect(load_watcher_,&QFutureWatcher<LoadResult>::finished,this,[this]{ finish_symbol_load(); });
         open_database(initial_database_path());
     }
 
@@ -202,6 +253,81 @@ private:
         settings.setValue("end_date",stock_end_->date().toString(Qt::ISODate));
     }
 
+    void load_symbol_data() {
+        const auto symbol=load_symbol_->text().trimmed().toUpper();
+        const auto start=load_start_->date();
+        const auto end=load_end_->date();
+        if(symbol.isEmpty()) {
+            load_status_->setText("Enter a symbol.");
+            return;
+        }
+        if(start>end) {
+            load_status_->setText("The start date must not be after the end date.");
+            return;
+        }
+
+        load_symbol_->setText(symbol);
+        load_button_->setEnabled(false);
+        load_symbol_->setEnabled(false);
+        load_start_->setEnabled(false);
+        load_end_->setEnabled(false);
+        load_status_->setText("Loading "+symbol+" from Alpaca…");
+        const auto database_path=database_path_;
+        const auto start_text=start.toString(Qt::ISODate);
+        const auto end_text=end.toString(Qt::ISODate);
+        load_watcher_->setFuture(QtConcurrent::run([symbol,database_path,start_text,end_text] {
+            LoadResult result{symbol,database_path};
+            try {
+                options::data::SqliteBarStore store(database_path.toStdString());
+                const options::data::DateRange requested{start_text.toStdString(),end_text.toStdString()};
+                const auto missing=store.missing_coverage(symbol.toStdString(),"alpaca","iex",
+                    "1Day","all",requested);
+                result.cached=missing.empty();
+                if(missing.empty()) return result;
+
+                options::providers::alpaca::AlpacaClient client(
+                    {environment("ALPACA_API_KEY"),environment("ALPACA_API_SECRET")});
+                for(const auto& range:missing) {
+                    options::providers::alpaca::BarsRequest request;
+                    request.symbols={symbol.toStdString()};
+                    request.start=range.start;
+                    request.end=range.end;
+                    request.feed="iex";
+                    const auto bars=client.fetch_bars(request);
+                    store.upsert(bars,"alpaca",request.feed,request.timeframe,request.adjustment);
+                    store.record_coverage(symbol.toStdString(),"alpaca",request.feed,
+                        request.timeframe,request.adjustment,range);
+                    result.downloaded+=bars.size();
+                }
+            } catch(const std::exception& error) {
+                result.error=QString::fromUtf8(error.what());
+            }
+            return result;
+        }));
+    }
+
+    void finish_symbol_load() {
+        load_button_->setEnabled(true);
+        load_symbol_->setEnabled(true);
+        load_start_->setEnabled(true);
+        load_end_->setEnabled(true);
+        const auto result=load_watcher_->result();
+        if(!result.error.isEmpty()) {
+            load_status_->setText("Load failed: "+result.error);
+            return;
+        }
+        load_status_->setText(result.cached
+            ? result.symbol+" is already cached for the selected range."
+            : result.downloaded==0
+                ? "Alpaca returned no IEX daily bars for "+result.symbol+" in the selected range."
+                : "Loaded "+QString::number(result.downloaded)+" daily bars for "+result.symbol+".");
+        if(result.database_path==database_path_) {
+            load_stock_symbols();
+            const auto index=stock_symbol_->findText(result.symbol);
+            if(index>=0) stock_symbol_->setCurrentIndex(index);
+        }
+    }
+
     void plot_underlying() {
         try {
             const auto symbol=stock_symbol_->currentText();
@@ -240,6 +366,11 @@ private:
     QDateEdit *stock_start_{},*stock_end_{};
     QDate available_start_,available_end_;
     TimelineChartView* stock_chart_view_{};
+    QLineEdit* load_symbol_{};
+    QDateEdit *load_start_{},*load_end_{};
+    QPushButton* load_button_{};
+    QLabel* load_status_{};
+    QFutureWatcher<LoadResult>* load_watcher_{};
 };
 
 }  // namespace

@@ -12,7 +12,7 @@ option(OPTIONS_BACKTESTER_WARNINGS_AS_ERRORS "Treat compiler warnings as errors"
 
 find_package(CURL REQUIRED)
 find_package(SQLite3 REQUIRED)
-find_package(Qt6 REQUIRED COMPONENTS Core Widgets Charts)
+find_package(Qt6 REQUIRED COMPONENTS Core Widgets Charts Concurrent)
 
 add_library(options_data
     src/data/bar.cpp
@@ -45,7 +45,7 @@ add_executable(options-backtester apps/cli/main.cpp)
 target_link_libraries(options-backtester PRIVATE options_data options_backtest)
 
 add_executable(options-viewer apps/desktop/main.cpp)
-target_link_libraries(options-viewer PRIVATE options_data Qt6::Widgets Qt6::Charts)
+target_link_libraries(options-viewer PRIVATE options_data Qt6::Widgets Qt6::Charts Qt6::Concurrent)
 
 if(BUILD_TESTING)
     add_executable(options_data_tests

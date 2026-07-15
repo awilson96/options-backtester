@@ -179,3 +179,9 @@ or changing either date updates the chart, and each symbol's selected date range
 is restored between sessions. Hold **Ctrl** while scrolling over the chart to move
 the selected date window left or right along the available timeline. Every five
 consecutive scroll events in one direction moves it by one step.
+
+The **Load Data** tab downloads IEX daily bars for a new symbol into the currently
+open database using `ALPACA_API_KEY` and `ALPACA_API_SECRET`. Its date selectors
+default to Alpaca's maximum supported market-calendar range, 1970-01-01 through
+today, and can be narrowed before loading. Previously covered ranges are read from
+the local cache, so only missing ranges are requested from Alpaca.
