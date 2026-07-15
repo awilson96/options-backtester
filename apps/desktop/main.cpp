@@ -28,6 +28,7 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPen>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSettings>
@@ -72,6 +73,26 @@ struct MomentumStudyRow {
     int skip_days{};
     int strike_offset{};
     options::analysis::MomentumResult result;
+};
+
+struct MomentumStudyRequest {
+    int window_days{};
+    int skip_days{};
+    int strike_offset{};
+    std::optional<options::analysis::StrikeAdjustment> strike_adjustment;
+    std::optional<options::analysis::SimulatedPricing> simulated_pricing;
+};
+
+struct MomentumAnalysisOutput {
+    bool parametric{};
+    bool strike_enabled{};
+    bool simulated_pricing{};
+    int window_days{};
+    int skip_days{};
+    int strike_offset{};
+    std::vector<MomentumStudyRow> study_rows;
+    std::optional<options::analysis::MomentumResult> single_result;
+    QString error;
 };
 
 struct MomentumStudyPreset {
@@ -776,7 +797,8 @@ private:
         description->setWordWrap(true);
         layout->addWidget(description);
 
-        auto* controls=new QFormLayout;
+        auto* controls_widget=new QWidget;
+        auto* controls=new QFormLayout(controls_widget);
         auto* parametric=new QCheckBox("Run a parametric study");
         auto* window_days=new QSpinBox;
         window_days->setRange(1,3650);
@@ -849,7 +871,7 @@ private:
         controls->addRow("Sell slippage",sell_slippage);
         controls->addRow("Analysis start",analysis_start);
         controls->addRow("Analysis end",analysis_end);
-        layout->addLayout(controls);
+        layout->addWidget(controls_widget);
 
         auto* parameter_ranges=new QWidget;
         auto* range_controls=new QFormLayout(parameter_ranges);
@@ -925,6 +947,20 @@ private:
         auto* analysis_status=new QLabel;
         analysis_status->setWordWrap(true);
         layout->addWidget(analysis_status);
+        auto* analysis_activity=new QWidget;
+        auto* activity_layout=new QHBoxLayout(analysis_activity);
+        activity_layout->setContentsMargins(0,0,0,0);
+        auto* activity_label=new QLabel("Analyzing…");
+        auto* activity_bar=new QProgressBar;
+        activity_bar->setRange(0,0);
+        activity_bar->setTextVisible(false);
+        activity_bar->setMaximumWidth(260);
+        activity_layout->addStretch();
+        activity_layout->addWidget(activity_label);
+        activity_layout->addWidget(activity_bar);
+        activity_layout->addStretch();
+        analysis_activity->setVisible(false);
+        layout->addWidget(analysis_activity);
         auto* dialog_buttons=new QHBoxLayout;
         auto* save_button=new QPushButton("Save Study…");
         auto* analyze_button=new QPushButton("Run Analysis");
@@ -1123,69 +1159,33 @@ private:
             refresh_saved_studies();
         });
 
-        const auto analyze=[&,symbol] {
-            if(analysis_start->date()>analysis_end->date()) {
-                analysis_status->setText("The analysis start must not be after the end.");
-                return;
-            }
-            try {
-                analyzed_bars=bar_store_->load({symbol.toStdString(),"alpaca","iex","1Day","all",
-                    analysis_start->date().toString(Qt::ISODate).toStdString(),
-                    analysis_end->date().toString(Qt::ISODate).toStdString()});
-                const auto& bars=analyzed_bars;
-                if(parametric->isChecked()) {
-                    if(window_minimum->value()>window_maximum->value() ||
-                       skip_minimum->value()>skip_maximum->value() ||
-                       (strike_enabled->isChecked() && strike_minimum->value()>strike_maximum->value())) {
-                        analysis_status->setText("Each parameter minimum must not exceed its maximum.");
-                        return;
-                    }
-                    const auto window_count=window_maximum->value()-window_minimum->value()+1;
-                    const auto skip_count=skip_maximum->value()-skip_minimum->value()+1;
-                    const auto strike_count=strike_enabled->isChecked()
-                        ? strike_maximum->value()-strike_minimum->value()+1 : 1;
-                    const auto combinations=static_cast<qint64>(window_count)*skip_count*strike_count;
-                    if(combinations>10000) {
-                        analysis_status->setText(
-                            "This study has "+QString::number(combinations)+
-                            " combinations. Narrow the ranges to 10,000 or fewer.");
-                        return;
-                    }
-                    study_rows.clear();
-                    study_rows.reserve(static_cast<std::size_t>(combinations));
-                    for(int x=window_minimum->value();x<=window_maximum->value();++x) {
-                        for(int d=skip_minimum->value();d<=skip_maximum->value();++d) {
-                            const auto first_strike=strike_enabled->isChecked() ? strike_minimum->value() : 0;
-                            const auto last_strike=strike_enabled->isChecked() ? strike_maximum->value() : 0;
-                            for(int offset=first_strike;offset<=last_strike;++offset) {
-                                std::optional<options::analysis::StrikeAdjustment> adjustment;
-                                if(strike_enabled->isChecked())
-                                    adjustment=options::analysis::StrikeAdjustment{strike_width->value(),offset};
-                                std::optional<options::analysis::SimulatedPricing> pricing;
-                                if(simulated_pricing->isChecked()) pricing=pricing_editor->pricing_for(offset);
-                                if(pricing) {
-                                    pricing->allocation=allocation->value();
-                                    pricing->buy_slippage_per_share=buy_slippage->value();
-                                    pricing->sell_slippage_per_share=sell_slippage->value();
-                                    pricing->slippage_mode=selected_slippage_mode();
-                                }
-                                if(simulated_pricing->isChecked() && !pricing) {
-                                    analysis_status->setText(
-                                        "Simulated pricing is missing for strike offset "+QString::number(offset)+".");
-                                    return;
-                                }
-                                study_rows.push_back({x,d,offset,options::analysis::analyze_momentum_drop_scenarios(
-                                    bars,static_cast<std::size_t>(x),static_cast<std::size_t>(d),adjustment,
-                                    pricing,drop_rate->value())});
-                            }
-                        }
-                    }
+        auto* analysis_watcher=new QFutureWatcher<MomentumAnalysisOutput>(&dialog);
+        const auto set_busy=[=](bool busy) {
+            controls_widget->setEnabled(!busy);
+            parameter_ranges->setEnabled(!busy);
+            pricing_editor->setEnabled(!busy);
+            study_table->setEnabled(!busy);
+            save_button->setEnabled(!busy);
+            analyze_button->setEnabled(!busy);
+            analysis_activity->setVisible(busy);
+        };
+        connect(analysis_watcher,&QFutureWatcher<MomentumAnalysisOutput>::finished,&dialog,
+            [&,symbol,set_busy,analysis_watcher] {
+                set_busy(false);
+                auto output=analysis_watcher->result();
+                if(!output.error.isEmpty()) {
+                    analysis_status->setText("Analysis failed: "+output.error);
+                    return;
+                }
+                if(output.parametric) {
+                    study_rows=std::move(output.study_rows);
                     active_sort_column=-1;
                     sort_cycle=0;
                     study_table->horizontalHeader()->setSortIndicatorShown(false);
-                    study_table->setColumnHidden(9,!simulated_pricing->isChecked());
-                    study_table->setColumnHidden(10,!simulated_pricing->isChecked());
-                    study_table->setColumnHidden(11,!simulated_pricing->isChecked());
+                    study_table->setColumnHidden(9,!output.simulated_pricing);
+                    study_table->setColumnHidden(10,!output.simulated_pricing);
+                    study_table->setColumnHidden(11,!output.simulated_pricing);
+                    study_table->setUpdatesEnabled(false);
                     study_table->setRowCount(static_cast<int>(study_rows.size()));
                     std::vector<std::size_t> comparison_rank(study_rows.size());
                     std::iota(comparison_rank.begin(),comparison_rank.end(),0);
@@ -1198,7 +1198,7 @@ private:
                     for(int row=0;row<static_cast<int>(study_rows.size());++row) {
                         const auto& value=study_rows[static_cast<std::size_t>(row)];
                         const QString cells[]{QString::number(row+1),QString::number(value.window_days),
-                            QString::number(value.skip_days),strike_enabled->isChecked()
+                            QString::number(value.skip_days),output.strike_enabled
                                 ? QString::number(value.strike_offset) : "Off",
                             QString::number(value.result.win_percentage,'f',2)+"%",
                             averaged_count(value.result.wins),averaged_count(value.result.losses),
@@ -1221,32 +1221,19 @@ private:
                             study_table->setItem(row,column,item);
                         }
                     }
+                    study_table->setUpdatesEnabled(true);
                     analysis_status->setText(
                         "Generated "+QString::number(study_rows.size())+
                         " parameter combinations. Click a header to sort"+
-                        (simulated_pricing->isChecked()
+                        (output.simulated_pricing
                             ? "; double-click a row to view its cumulative profit chart." : "."));
                     return;
                 }
-                std::optional<options::analysis::StrikeAdjustment> adjustment;
-                if(strike_enabled->isChecked())
-                    adjustment=options::analysis::StrikeAdjustment{
-                        strike_width->value(),strike_offset->value()};
-                std::optional<options::analysis::SimulatedPricing> pricing;
-                if(simulated_pricing->isChecked()) pricing=pricing_editor->pricing_for(strike_offset->value());
-                if(pricing) {
-                    pricing->allocation=allocation->value();
-                    pricing->buy_slippage_per_share=buy_slippage->value();
-                    pricing->sell_slippage_per_share=sell_slippage->value();
-                    pricing->slippage_mode=selected_slippage_mode();
-                }
-                if(simulated_pricing->isChecked() && !pricing) {
-                    analysis_status->setText("Simulated pricing is missing for this strike offset.");
+                if(!output.single_result) {
+                    analysis_status->setText("Analysis failed to return a result.");
                     return;
                 }
-                const auto result=options::analysis::analyze_momentum_drop_scenarios(
-                    bars,static_cast<std::size_t>(window_days->value()),
-                    static_cast<std::size_t>(skip_days->value()),adjustment,pricing,drop_rate->value());
+                const auto& result=*output.single_result;
                 win_percentage->setText(QString::number(result.win_percentage,'f',2)+"%");
                 wins->setText(averaged_count(result.wins));
                 losses->setText(averaged_count(result.losses));
@@ -1256,11 +1243,123 @@ private:
                 analysis_status->setText(result.comparisons==0
                     ? "The selected analysis range is too short for this comparison window."
                     : QString());
-                if(simulated_pricing->isChecked() && result.comparisons!=0)
-                    show_profit_chart(&dialog,symbol+"  x="+QString::number(window_days->value())+
-                        " d="+QString::number(skip_days->value())+
-                        " strike="+QString::number(strike_offset->value()),result,bars);
+                if(output.simulated_pricing && result.comparisons!=0)
+                    show_profit_chart(&dialog,symbol+"  x="+QString::number(output.window_days)+
+                        " d="+QString::number(output.skip_days)+
+                        " strike="+QString::number(output.strike_offset),result,analyzed_bars);
+            });
+
+        const auto analyze=[&,symbol,set_busy,analysis_watcher] {
+            if(analysis_watcher->isRunning()) return;
+            if(analysis_start->date()>analysis_end->date()) {
+                analysis_status->setText("The analysis start must not be after the end.");
+                return;
+            }
+            try {
+                analyzed_bars=bar_store_->load({symbol.toStdString(),"alpaca","iex","1Day","all",
+                    analysis_start->date().toString(Qt::ISODate).toStdString(),
+                    analysis_end->date().toString(Qt::ISODate).toStdString()});
+                MomentumAnalysisOutput output;
+                output.parametric=parametric->isChecked();
+                output.strike_enabled=strike_enabled->isChecked();
+                output.simulated_pricing=simulated_pricing->isChecked();
+                output.window_days=window_days->value();
+                output.skip_days=skip_days->value();
+                output.strike_offset=strike_offset->value();
+                std::vector<MomentumStudyRequest> requests;
+                if(output.parametric) {
+                    if(window_minimum->value()>window_maximum->value() ||
+                       skip_minimum->value()>skip_maximum->value() ||
+                       (output.strike_enabled && strike_minimum->value()>strike_maximum->value())) {
+                        analysis_status->setText("Each parameter minimum must not exceed its maximum.");
+                        return;
+                    }
+                    const auto window_count=window_maximum->value()-window_minimum->value()+1;
+                    const auto skip_count=skip_maximum->value()-skip_minimum->value()+1;
+                    const auto strike_count=output.strike_enabled
+                        ? strike_maximum->value()-strike_minimum->value()+1 : 1;
+                    const auto combinations=static_cast<qint64>(window_count)*skip_count*strike_count;
+                    if(combinations>10000) {
+                        analysis_status->setText(
+                            "This study has "+QString::number(combinations)+
+                            " combinations. Narrow the ranges to 10,000 or fewer.");
+                        return;
+                    }
+                    requests.reserve(static_cast<std::size_t>(combinations));
+                    for(int x=window_minimum->value();x<=window_maximum->value();++x) {
+                        for(int d=skip_minimum->value();d<=skip_maximum->value();++d) {
+                            const auto first_strike=output.strike_enabled ? strike_minimum->value() : 0;
+                            const auto last_strike=output.strike_enabled ? strike_maximum->value() : 0;
+                            for(int offset=first_strike;offset<=last_strike;++offset) {
+                                MomentumStudyRequest request{x,d,offset};
+                                if(output.strike_enabled)
+                                    request.strike_adjustment=options::analysis::StrikeAdjustment{
+                                        strike_width->value(),offset};
+                                if(output.simulated_pricing)
+                                    request.simulated_pricing=pricing_editor->pricing_for(offset);
+                                if(output.simulated_pricing && !request.simulated_pricing) {
+                                    analysis_status->setText(
+                                        "Simulated pricing is missing for strike offset "+QString::number(offset)+".");
+                                    return;
+                                }
+                                requests.push_back(std::move(request));
+                            }
+                        }
+                    }
+                } else {
+                    MomentumStudyRequest request{
+                        output.window_days,output.skip_days,output.strike_offset};
+                    if(output.strike_enabled)
+                        request.strike_adjustment=options::analysis::StrikeAdjustment{
+                            strike_width->value(),output.strike_offset};
+                    if(output.simulated_pricing)
+                        request.simulated_pricing=pricing_editor->pricing_for(output.strike_offset);
+                    if(output.simulated_pricing && !request.simulated_pricing) {
+                        analysis_status->setText("Simulated pricing is missing for this strike offset.");
+                        return;
+                    }
+                    requests.push_back(std::move(request));
+                }
+                if(output.simulated_pricing) {
+                    for(auto& request:requests) {
+                        request.simulated_pricing->allocation=allocation->value();
+                        request.simulated_pricing->buy_slippage_per_share=buy_slippage->value();
+                        request.simulated_pricing->sell_slippage_per_share=sell_slippage->value();
+                        request.simulated_pricing->slippage_mode=selected_slippage_mode();
+                    }
+                }
+                const auto request_count=requests.size();
+                const auto rate=drop_rate->value();
+                analysis_status->setText(output.parametric
+                    ? "Analyzing "+QString::number(request_count)+" parameter combinations…"
+                    : "Running analysis…");
+                set_busy(true);
+                analysis_watcher->setFuture(QtConcurrent::run(
+                    [bars=analyzed_bars,requests=std::move(requests),rate,output=std::move(output)]() mutable {
+                        try {
+                            if(output.parametric) {
+                                output.study_rows.reserve(requests.size());
+                                for(const auto& request:requests) {
+                                    output.study_rows.push_back({request.window_days,request.skip_days,
+                                        request.strike_offset,options::analysis::analyze_momentum_drop_scenarios(
+                                            bars,static_cast<std::size_t>(request.window_days),
+                                            static_cast<std::size_t>(request.skip_days),request.strike_adjustment,
+                                            request.simulated_pricing,rate)});
+                                }
+                            } else {
+                                const auto& request=requests.front();
+                                output.single_result=options::analysis::analyze_momentum_drop_scenarios(
+                                    bars,static_cast<std::size_t>(request.window_days),
+                                    static_cast<std::size_t>(request.skip_days),request.strike_adjustment,
+                                    request.simulated_pricing,rate);
+                            }
+                        } catch(const std::exception& error) {
+                            output.error=QString::fromUtf8(error.what());
+                        }
+                        return output;
+                    }));
             } catch(const std::exception& error) {
+                set_busy(false);
                 analysis_status->setText("Analysis failed: "+QString::fromUtf8(error.what()));
             }
         };

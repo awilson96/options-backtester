@@ -265,6 +265,13 @@ active ordering.
 Single-value DTE, Skip, and Strike Offset fields are hidden while parametric mode
 is active; their inclusive range controls take their place.
 
+Momentum calculations run on a background worker so long parametric studies do
+not block the desktop interface or cause operating-system “not responding”
+warnings. While a study is running, the dialog shows an animated activity
+indicator and the number of parameter combinations being evaluated. Parameter,
+save, and run controls are temporarily locked so the displayed results always
+correspond to the exact settings captured at the start of the run.
+
 The **Load Data** tab downloads IEX daily bars for a new symbol into the currently
 open database using `ALPACA_API_KEY` and `ALPACA_API_SECRET`. Its date selectors
 default to Alpaca's maximum supported market-calendar range, 1970-01-01 through
