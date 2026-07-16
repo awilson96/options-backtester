@@ -51,7 +51,7 @@ TEST_CASE("momentum analysis averages every calendar phase of its skip window") 
 TEST_CASE("momentum analysis compares against the configured strike grid") {
     const std::vector<options::data::Bar> bars{
         {"TEST","2024-01-01T00:00:00Z",0,0,0,12},
-        {"TEST","2024-01-02T00:00:00Z",0,0,0,12.25},
+        {"TEST","2024-01-02T00:00:00Z",0,0,0,13},
     };
     const auto above=options::analysis::analyze_momentum(
         bars,1,1,options::analysis::StrikeAdjustment{2.5,1});
@@ -61,6 +61,20 @@ TEST_CASE("momentum analysis compares against the configured strike grid") {
     REQUIRE(above.wins==0);
     REQUIRE(below.wins==1);
     REQUIRE(below.losses==0);
+}
+
+TEST_CASE("momentum comparison price uses the second spread leg one strike width higher") {
+    const std::vector<options::data::Bar> bars{
+        {"TEST","2024-01-01T00:00:00Z",0,0,0,12},
+        {"TEST","2024-01-02T00:00:00Z",0,0,0,13},
+    };
+    const auto result=options::analysis::analyze_momentum(
+        bars,1,1,options::analysis::StrikeAdjustment{2.5,-1},
+        options::analysis::SimulatedPricing{100,100,1000},0,0,true);
+    REQUIRE(result.trades.size()==1);
+    REQUIRE(result.trades.front().comparison_price==12.5);
+    REQUIRE(result.trades.front().result==
+        options::analysis::MomentumResult::TradeResult::itm);
 }
 
 TEST_CASE("momentum simulated pricing produces profit and ending allocation percentage") {

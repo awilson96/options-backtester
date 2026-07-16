@@ -242,8 +242,11 @@ synthetic option-strike threshold. Strikes are multiples of the configured dolla
 width anchored at zero, so a $2.50 width produces $10.00, $12.50, $15.00, and so
 on. Offset -1 selects the first strike strictly below q, +1 the first strictly
 above q, and 0 the nearest strike; larger magnitudes move farther along the grid.
-In parametric mode the strike-offset range is studied alongside x and d, while
-the strike width remains fixed at the programmed value.
+That selected strike represents the lower spread leg. The comparison threshold is
+the second leg one configured strike width higher, so it is calculated as
+`selected strike + strike width`. The ledger and hover shading use this same upper
+spread boundary. In parametric mode the strike-offset range is studied alongside x
+and d, while the strike width remains fixed at the programmed value.
 
 Enable **Use simulated spread pricing** to provide one-contract maximum-profit and
 maximum-loss values for every studied strike offset. When negative and positive
@@ -307,10 +310,14 @@ is active; their inclusive range controls take their place.
 
 Momentum calculations run on a background worker so long parametric studies do
 not block the desktop interface or cause operating-system “not responding”
-warnings. While a study is running, the dialog shows an animated activity
-indicator and the number of parameter combinations being evaluated. Parameter,
-save, and run controls are temporarily locked so the displayed results always
-correspond to the exact settings captured at the start of the run.
+warnings. After the cache check, independent parameter combinations are distributed
+through a thread-safe work queue across as many workers as Qt reports available
+CPU cores. Results are written back in their original deterministic order. While
+a study is running, the progress bar reports completed, total, and remaining
+parameter combinations; once calculation finishes it indicates that cache results
+are being saved. Parameter, save, and run controls are temporarily locked so the
+displayed results always correspond to the exact settings captured at the start
+of the run.
 
 The Momentum dialog opens at a screen-aware size, can be maximized or expanded
 without an application-imposed maximum width, and automatically grows when

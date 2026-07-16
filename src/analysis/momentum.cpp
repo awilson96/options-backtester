@@ -32,11 +32,14 @@ struct ScheduledTrade {
 double comparison_price(double underlying,const std::optional<StrikeAdjustment>& adjustment) {
     if(!adjustment) return underlying;
     const auto units=underlying/adjustment->width;
+    double selected_strike{};
     if(adjustment->offset<0)
-        return (std::ceil(units)+static_cast<double>(adjustment->offset))*adjustment->width;
-    if(adjustment->offset>0)
-        return (std::floor(units)+static_cast<double>(adjustment->offset))*adjustment->width;
-    return std::round(units)*adjustment->width;
+        selected_strike=(std::ceil(units)+static_cast<double>(adjustment->offset))*adjustment->width;
+    else if(adjustment->offset>0)
+        selected_strike=(std::floor(units)+static_cast<double>(adjustment->offset))*adjustment->width;
+    else
+        selected_strike=std::round(units)*adjustment->width;
+    return selected_strike+adjustment->width;
 }
 
 double slippage_cost(const SimulatedPricing& pricing) {

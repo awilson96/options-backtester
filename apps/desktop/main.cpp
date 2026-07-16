@@ -43,6 +43,7 @@
 #include <QSplitter>
 #include <QTabWidget>
 #include <QTableWidget>
+#include <QThread>
 #include <QTimer>
 #include <QStandardPaths>
 #include <QValueAxis>
@@ -53,17 +54,20 @@
 
 #include <cstdlib>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <filesystem>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -119,6 +123,12 @@ struct MomentumLedgerOutput {
     options::analysis::MomentumResult result;
     std::vector<options::data::Bar> bars;
     QString error;
+};
+
+struct AnalysisProgress {
+    std::atomic<std::size_t> completed{};
+    std::atomic<bool> calculating{};
+    std::size_t total{};
 };
 
 struct MomentumStudyPreset {
@@ -247,7 +257,7 @@ void delete_study_preset(const QString& id) {
 }
 
 constexpr quint32 analysis_cache_magic=0x4d4f4d43;
-constexpr quint32 analysis_cache_version=3;
+constexpr quint32 analysis_cache_version=4;
 
 void write_profit_curve(QDataStream& stream,
     const std::vector<options::analysis::MomentumResult::ProfitPoint>& curve) {
@@ -1445,6 +1455,27 @@ private:
         std::vector<MomentumStudyRow> study_rows;
         std::vector<options::data::Bar> analyzed_bars;
         QString analyzed_symbol=symbol;
+        std::shared_ptr<AnalysisProgress> active_analysis_progress;
+        auto* progress_timer=new QTimer(&dialog);
+        progress_timer->setInterval(100);
+        connect(progress_timer,&QTimer::timeout,&dialog,[&] {
+            if(!active_analysis_progress) return;
+            if(!active_analysis_progress->calculating.load(std::memory_order_relaxed)) {
+                activity_label->setText("Checking saved results…");
+                activity_bar->setRange(0,0);
+                return;
+            }
+            const auto completed=active_analysis_progress->completed.load(std::memory_order_relaxed);
+            const auto total=active_analysis_progress->total;
+            const auto remaining=total>completed ? total-completed : 0;
+            activity_bar->setRange(0,static_cast<int>(total));
+            activity_bar->setValue(static_cast<int>(completed));
+            activity_label->setText(remaining==0
+                ? QString::number(total)+" / "+QString::number(total)+
+                    " complete — saving results…"
+                : QString::number(completed)+" / "+QString::number(total)+
+                    " complete — "+QString::number(remaining)+" remaining");
+        });
         connect(study_table->horizontalHeader(),&QHeaderView::sectionClicked,&dialog,
             [=,&active_sort_column,&sort_cycle](int column) {
                 if(study_table->rowCount()==0) return;
@@ -1472,6 +1503,8 @@ private:
             analyze_button->setEnabled(true);
             save_button->setEnabled(true);
             analysis_activity->setVisible(false);
+            activity_label->setText("Analyzing…");
+            activity_bar->setRange(0,0);
             auto output=ledger_watcher->result();
             if(!output.error.isEmpty()) {
                 analysis_status->setText("Ledger generation failed: "+output.error);
@@ -1503,6 +1536,8 @@ private:
                 study_table->setEnabled(false);
                 analyze_button->setEnabled(false);
                 save_button->setEnabled(false);
+                activity_label->setText("Generating trade ledger…");
+                activity_bar->setRange(0,0);
                 analysis_activity->setVisible(true);
                 analysis_status->setText("Generating the selected row's median-scenario trade ledger…");
                 ledger_watcher->setFuture(QtConcurrent::run(
@@ -1737,7 +1772,7 @@ private:
         });
 
         auto* analysis_watcher=new QFutureWatcher<MomentumAnalysisOutput>(&dialog);
-        const auto set_busy=[=](bool busy) {
+        const auto set_busy=[=,&active_analysis_progress](bool busy) {
             controls_widget->setEnabled(!busy);
             parameter_ranges->setEnabled(!busy);
             pricing_editor->setEnabled(!busy);
@@ -1745,6 +1780,14 @@ private:
             save_button->setEnabled(!busy);
             analyze_button->setEnabled(!busy);
             analysis_activity->setVisible(busy);
+            if(busy) {
+                progress_timer->start();
+            } else {
+                progress_timer->stop();
+                active_analysis_progress.reset();
+                activity_label->setText("Analyzing…");
+                activity_bar->setRange(0,0);
+            }
         };
         connect(analysis_watcher,&QFutureWatcher<MomentumAnalysisOutput>::finished,&dialog,
             [&,set_busy,analysis_watcher] {
@@ -1925,15 +1968,20 @@ private:
                 }
                 const auto request_count=requests.size();
                 const auto rate=drop_rate->value();
+                active_analysis_progress=std::make_shared<AnalysisProgress>();
+                active_analysis_progress->total=request_count;
+                const auto progress=active_analysis_progress;
+                const auto available_cores=std::max(1,QThread::idealThreadCount());
                 analysis_status->setText(cache_only ? "Loading saved analysis results…" :
                     output.parametric
                         ? "Checking the cache, then analyzing "+QString::number(request_count)+
-                            " parameter combinations if needed…"
+                            " parameter combinations on up to "+QString::number(available_cores)+
+                            " CPU cores if needed…"
                         : "Checking the cache, then running the analysis if needed…");
                 set_busy(true);
                 analysis_watcher->setFuture(QtConcurrent::run(
                     [bars=analyzed_bars,requests=std::move(requests),rate,cache_only,
-                     output=std::move(output)]() mutable {
+                     output=std::move(output),progress]() mutable {
                         if(auto cached=load_cached_analysis(output.cache_key)) {
                             cached->output.cache_key=output.cache_key;
                             cached->output.settings_signature=output.settings_signature;
@@ -1945,23 +1993,62 @@ private:
                             output.cache_miss=true;
                             return output;
                         }
+                        progress->calculating.store(true,std::memory_order_relaxed);
                         try {
                             if(output.parametric) {
-                                output.study_rows.reserve(requests.size());
-                                for(const auto& request:requests) {
-                                    output.study_rows.push_back({request.window_days,request.skip_days,
-                                        request.strike_offset,options::analysis::analyze_momentum_drop_scenarios(
-                                            bars,static_cast<std::size_t>(request.window_days),
-                                            static_cast<std::size_t>(request.skip_days),request.strike_adjustment,
-                                            request.simulated_pricing,rate),request.strike_adjustment,
-                                        request.simulated_pricing,rate});
+                                std::vector<MomentumStudyRow> rows(requests.size());
+                                std::atomic<std::size_t> next_index{};
+                                std::atomic<bool> failed{};
+                                std::mutex error_mutex;
+                                std::string worker_error;
+                                const auto core_count=static_cast<std::size_t>(
+                                    std::max(1,QThread::idealThreadCount()));
+                                const auto worker_count=std::min(core_count,requests.size());
+                                {
+                                    std::vector<std::jthread> workers;
+                                    workers.reserve(worker_count);
+                                    for(std::size_t worker=0;worker<worker_count;++worker) {
+                                        workers.emplace_back([&] {
+                                            while(!failed.load(std::memory_order_relaxed)) {
+                                                const auto index=next_index.fetch_add(
+                                                    1,std::memory_order_relaxed);
+                                                if(index>=requests.size()) break;
+                                                const auto& request=requests[index];
+                                                try {
+                                                    rows[index]={request.window_days,request.skip_days,
+                                                        request.strike_offset,
+                                                        options::analysis::analyze_momentum_drop_scenarios(
+                                                            bars,static_cast<std::size_t>(request.window_days),
+                                                            static_cast<std::size_t>(request.skip_days),
+                                                            request.strike_adjustment,request.simulated_pricing,rate),
+                                                        request.strike_adjustment,request.simulated_pricing,rate};
+                                                    progress->completed.fetch_add(1,std::memory_order_relaxed);
+                                                } catch(const std::exception& error) {
+                                                    {
+                                                        std::lock_guard lock(error_mutex);
+                                                        if(worker_error.empty()) worker_error=error.what();
+                                                    }
+                                                    failed.store(true,std::memory_order_relaxed);
+                                                } catch(...) {
+                                                    {
+                                                        std::lock_guard lock(error_mutex);
+                                                        if(worker_error.empty()) worker_error="unknown worker error";
+                                                    }
+                                                    failed.store(true,std::memory_order_relaxed);
+                                                }
+                                            }
+                                        });
+                                    }
                                 }
+                                if(!worker_error.empty()) throw std::runtime_error(worker_error);
+                                output.study_rows=std::move(rows);
                             } else {
                                 const auto& request=requests.front();
                                 output.single_result=options::analysis::analyze_momentum_drop_scenarios(
                                     bars,static_cast<std::size_t>(request.window_days),
                                     static_cast<std::size_t>(request.skip_days),request.strike_adjustment,
                                     request.simulated_pricing,rate);
+                                progress->completed.store(1,std::memory_order_relaxed);
                             }
                         } catch(const std::exception& error) {
                             output.error=QString::fromUtf8(error.what());
