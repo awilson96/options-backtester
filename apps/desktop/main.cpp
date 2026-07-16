@@ -11,10 +11,14 @@
 #include <QComboBox>
 #include <QDateEdit>
 #include <QDateTimeAxis>
+#include <QDataStream>
 #include <QDialog>
 #include <QDoubleSpinBox>
+#include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QCryptographicHash>
+#include <QDir>
 #include <QFormLayout>
 #include <QFutureWatcher>
 #include <QHeaderView>
@@ -30,12 +34,16 @@
 #include <QPen>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QScreen>
 #include <QScrollArea>
+#include <QSaveFile>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QTabWidget>
 #include <QTableWidget>
+#include <QTimer>
+#include <QStandardPaths>
 #include <QValueAxis>
 #include <QVBoxLayout>
 #include <QWheelEvent>
@@ -84,6 +92,7 @@ struct MomentumStudyRequest {
 };
 
 struct MomentumAnalysisOutput {
+    QString symbol;
     bool parametric{};
     bool strike_enabled{};
     bool simulated_pricing{};
@@ -93,6 +102,11 @@ struct MomentumAnalysisOutput {
     std::vector<MomentumStudyRow> study_rows;
     std::optional<options::analysis::MomentumResult> single_result;
     QString error;
+    QString cache_key;
+    QString settings_signature;
+    bool from_cache{};
+    bool open_profit_chart{};
+    bool cache_miss{};
 };
 
 struct MomentumStudyPreset {
@@ -120,6 +134,7 @@ struct MomentumStudyPreset {
     int strike_minimum{-1};
     int strike_maximum{1};
     std::map<int,std::pair<double,double>> pricing;
+    QString result_cache_key;
 };
 
 std::vector<MomentumStudyPreset> load_study_presets() {
@@ -153,6 +168,7 @@ std::vector<MomentumStudyPreset> load_study_presets() {
             value.skip_maximum=settings.value("skip_maximum",30).toInt();
             value.strike_minimum=settings.value("strike_minimum",-1).toInt();
             value.strike_maximum=settings.value("strike_maximum",1).toInt();
+            value.result_cache_key=settings.value("result_cache_key").toString();
             const auto pricing_count=settings.beginReadArray("pricing");
             for(int index=0;index<pricing_count;++index) {
                 settings.setArrayIndex(index);
@@ -176,7 +192,7 @@ void save_study_preset(const MomentumStudyPreset& value) {
     settings.beginGroup("saved_studies");
     settings.beginGroup(value.id);
     settings.remove("");
-    settings.setValue("schema_version",1);
+    settings.setValue("schema_version",2);
     settings.setValue("strategy","momentum");
     settings.setValue("name",value.name);
     settings.setValue("symbol",value.symbol);
@@ -200,6 +216,7 @@ void save_study_preset(const MomentumStudyPreset& value) {
     settings.setValue("skip_maximum",value.skip_maximum);
     settings.setValue("strike_minimum",value.strike_minimum);
     settings.setValue("strike_maximum",value.strike_maximum);
+    settings.setValue("result_cache_key",value.result_cache_key);
     settings.beginWriteArray("pricing",static_cast<int>(value.pricing.size()));
     int index=0;
     for(const auto& [offset,pricing]:value.pricing) {
@@ -209,6 +226,182 @@ void save_study_preset(const MomentumStudyPreset& value) {
         settings.setValue("max_loss",pricing.second);
     }
     settings.endArray();
+}
+
+void delete_study_preset(const QString& id) {
+    QSettings settings("OptionsBacktester","OptionsBacktester");
+    settings.beginGroup("saved_studies");
+    settings.remove(id);
+}
+
+constexpr quint32 analysis_cache_magic=0x4d4f4d43;
+constexpr quint32 analysis_cache_version=1;
+
+void write_profit_curve(QDataStream& stream,
+    const std::vector<options::analysis::MomentumResult::ProfitPoint>& curve) {
+    stream<<static_cast<quint64>(curve.size());
+    for(const auto& point:curve)
+        stream<<QString::fromStdString(point.date)<<point.cumulative_profit;
+}
+
+bool read_profit_curve(QDataStream& stream,
+    std::vector<options::analysis::MomentumResult::ProfitPoint>& curve) {
+    quint64 count{};
+    stream>>count;
+    if(count>10000000) return false;
+    curve.clear();
+    curve.reserve(static_cast<std::size_t>(count));
+    for(quint64 index=0;index<count;++index) {
+        QString date;
+        double profit{};
+        stream>>date>>profit;
+        curve.push_back({date.toStdString(),profit});
+    }
+    return stream.status()==QDataStream::Ok;
+}
+
+void write_momentum_result(QDataStream& stream,const options::analysis::MomentumResult& value) {
+    stream<<value.comparisons<<value.skipped_comparisons<<value.dropped_comparisons
+          <<value.wins<<value.losses<<value.ties<<value.win_percentage<<value.total_profit
+          <<value.profit_percentage<<value.allocation<<value.ending_balance<<value.required_capital;
+    write_profit_curve(stream,value.profit_curve);
+    write_profit_curve(stream,value.high_profit_curve);
+    write_profit_curve(stream,value.low_profit_curve);
+    write_profit_curve(stream,value.no_drop_profit_curve);
+    stream<<static_cast<quint64>(value.drop_scenario_count);
+}
+
+bool read_momentum_result(QDataStream& stream,options::analysis::MomentumResult& value) {
+    stream>>value.comparisons>>value.skipped_comparisons>>value.dropped_comparisons
+          >>value.wins>>value.losses>>value.ties>>value.win_percentage>>value.total_profit
+          >>value.profit_percentage>>value.allocation>>value.ending_balance>>value.required_capital;
+    if(!read_profit_curve(stream,value.profit_curve) ||
+       !read_profit_curve(stream,value.high_profit_curve) ||
+       !read_profit_curve(stream,value.low_profit_curve) ||
+       !read_profit_curve(stream,value.no_drop_profit_curve)) return false;
+    quint64 scenarios{};
+    stream>>scenarios;
+    value.drop_scenario_count=static_cast<std::size_t>(scenarios);
+    return stream.status()==QDataStream::Ok;
+}
+
+QByteArray momentum_preset_bytes(const MomentumStudyPreset& value) {
+    QByteArray bytes;
+    QDataStream stream(&bytes,QIODevice::WriteOnly);
+    stream.setVersion(QDataStream::Qt_6_0);
+    stream<<analysis_cache_version<<value.symbol<<value.parametric<<value.window_days
+          <<value.skip_days<<value.drop_rate<<value.strike_enabled<<value.strike_width
+          <<value.strike_offset<<value.simulated_pricing<<value.allocation<<value.slippage_mode
+          <<value.buy_slippage<<value.sell_slippage<<value.analysis_start<<value.analysis_end
+          <<value.window_minimum<<value.window_maximum<<value.skip_minimum<<value.skip_maximum
+          <<value.strike_minimum<<value.strike_maximum<<static_cast<quint64>(value.pricing.size());
+    for(const auto& [offset,pricing]:value.pricing)
+        stream<<offset<<pricing.first<<pricing.second;
+    return bytes;
+}
+
+QString momentum_settings_signature(const MomentumStudyPreset& value) {
+    return QString::fromLatin1(QCryptographicHash::hash(
+        momentum_preset_bytes(value),QCryptographicHash::Sha256).toHex());
+}
+
+QString momentum_cache_key(const MomentumStudyPreset& value,std::span<const options::data::Bar> bars) {
+    auto bytes=momentum_preset_bytes(value);
+    QDataStream stream(&bytes,QIODevice::Append);
+    stream.setVersion(QDataStream::Qt_6_0);
+    stream<<static_cast<quint64>(bars.size());
+    for(const auto& bar:bars)
+        stream<<QString::fromStdString(bar.symbol)<<QString::fromStdString(bar.timestamp)
+              <<bar.open<<bar.high<<bar.low<<bar.close<<static_cast<qint64>(bar.volume)
+              <<static_cast<qint64>(bar.trade_count)<<bar.vwap;
+    return QString::fromLatin1(
+        QCryptographicHash::hash(bytes,QCryptographicHash::Sha256).toHex());
+}
+
+QString analysis_cache_path(const QString& key) {
+    const auto directory=QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation)+
+        "/analysis-cache";
+    QDir().mkpath(directory);
+    return directory+"/"+key+".bin";
+}
+
+void save_cached_analysis(const QString& key,const MomentumAnalysisOutput& output,
+                          std::span<const options::data::Bar> bars) {
+    QSaveFile file(analysis_cache_path(key));
+    if(!file.open(QIODevice::WriteOnly)) return;
+    QDataStream stream(&file);
+    stream.setVersion(QDataStream::Qt_6_0);
+    stream<<analysis_cache_magic<<analysis_cache_version<<key<<output.symbol<<output.parametric
+          <<output.strike_enabled<<output.simulated_pricing<<output.window_days<<output.skip_days
+          <<output.strike_offset<<static_cast<quint64>(output.study_rows.size());
+    for(const auto& row:output.study_rows) {
+        stream<<row.window_days<<row.skip_days<<row.strike_offset;
+        write_momentum_result(stream,row.result);
+    }
+    stream<<output.single_result.has_value();
+    if(output.single_result) write_momentum_result(stream,*output.single_result);
+    stream<<static_cast<quint64>(bars.size());
+    for(const auto& bar:bars)
+        stream<<QString::fromStdString(bar.symbol)<<QString::fromStdString(bar.timestamp)
+              <<bar.open<<bar.high<<bar.low<<bar.close<<static_cast<qint64>(bar.volume)
+              <<static_cast<qint64>(bar.trade_count)<<bar.vwap;
+    if(stream.status()==QDataStream::Ok) file.commit();
+}
+
+struct CachedMomentumAnalysis {
+    MomentumAnalysisOutput output;
+    std::vector<options::data::Bar> bars;
+};
+
+std::optional<CachedMomentumAnalysis> load_cached_analysis(const QString& key) {
+    QFile file(analysis_cache_path(key));
+    if(!file.open(QIODevice::ReadOnly)) return std::nullopt;
+    QDataStream stream(&file);
+    stream.setVersion(QDataStream::Qt_6_0);
+    quint32 magic{},version{};
+    QString stored_key;
+    CachedMomentumAnalysis cached;
+    stream>>magic>>version>>stored_key;
+    if(magic!=analysis_cache_magic || version!=analysis_cache_version || stored_key!=key)
+        return std::nullopt;
+    stream>>cached.output.symbol>>cached.output.parametric>>cached.output.strike_enabled
+          >>cached.output.simulated_pricing>>cached.output.window_days>>cached.output.skip_days
+          >>cached.output.strike_offset;
+    quint64 row_count{};
+    stream>>row_count;
+    if(row_count>10000) return std::nullopt;
+    cached.output.study_rows.reserve(static_cast<std::size_t>(row_count));
+    for(quint64 index=0;index<row_count;++index) {
+        MomentumStudyRow row;
+        stream>>row.window_days>>row.skip_days>>row.strike_offset;
+        if(!read_momentum_result(stream,row.result)) return std::nullopt;
+        cached.output.study_rows.push_back(std::move(row));
+    }
+    bool has_single{};
+    stream>>has_single;
+    if(has_single) {
+        cached.output.single_result.emplace();
+        if(!read_momentum_result(stream,*cached.output.single_result)) return std::nullopt;
+    }
+    quint64 bar_count{};
+    stream>>bar_count;
+    if(bar_count>10000000) return std::nullopt;
+    cached.bars.reserve(static_cast<std::size_t>(bar_count));
+    for(quint64 index=0;index<bar_count;++index) {
+        options::data::Bar bar;
+        QString symbol,timestamp;
+        qint64 volume{},trade_count{};
+        stream>>symbol>>timestamp>>bar.open>>bar.high>>bar.low>>bar.close>>volume>>trade_count>>bar.vwap;
+        bar.symbol=symbol.toStdString();
+        bar.timestamp=timestamp.toStdString();
+        bar.volume=volume;
+        bar.trade_count=trade_count;
+        cached.bars.push_back(std::move(bar));
+    }
+    if(stream.status()!=QDataStream::Ok) return std::nullopt;
+    cached.output.cache_key=key;
+    cached.output.from_cache=true;
+    return cached;
 }
 
 class NumericTableWidgetItem final : public QTableWidgetItem {
@@ -581,18 +774,14 @@ public:
         stock_layout->addLayout(stock_controls);
         auto* saved_studies_row=new QHBoxLayout;
         saved_studies_row->addWidget(new QLabel("Saved studies:"));
-        auto* saved_studies_container=new QWidget;
-        saved_studies_layout_=new QHBoxLayout(saved_studies_container);
-        saved_studies_layout_->setContentsMargins(0,0,0,0);
-        saved_studies_layout_->setAlignment(Qt::AlignLeft);
-        auto* saved_studies_scroll=new QScrollArea;
-        saved_studies_scroll->setWidget(saved_studies_container);
-        saved_studies_scroll->setWidgetResizable(true);
-        saved_studies_scroll->setFrameShape(QFrame::NoFrame);
-        saved_studies_scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
-        saved_studies_scroll->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-        saved_studies_scroll->setFixedHeight(48);
-        saved_studies_row->addWidget(saved_studies_scroll,1);
+        saved_studies_=new QComboBox;
+        saved_studies_->setMinimumWidth(260);
+        load_study_button_=new QPushButton("Load");
+        delete_study_button_=new QPushButton("Delete");
+        saved_studies_row->addWidget(saved_studies_);
+        saved_studies_row->addWidget(load_study_button_);
+        saved_studies_row->addWidget(delete_study_button_);
+        saved_studies_row->addStretch();
         stock_layout->addLayout(saved_studies_row);
         stock_chart_view_=new TimelineChartView([this](int direction){ shift_date_window(direction); });
         stock_chart_view_->setRenderHint(QPainter::Antialiasing);
@@ -635,6 +824,8 @@ public:
         });
         connect(load_button_,&QPushButton::clicked,this,[this]{ load_symbol_data(); });
         connect(load_symbol_,&QLineEdit::returnPressed,this,[this]{ load_symbol_data(); });
+        connect(load_study_button_,&QPushButton::clicked,this,[this]{ load_selected_study(); });
+        connect(delete_study_button_,&QPushButton::clicked,this,[this]{ delete_selected_study(); });
         load_watcher_=new QFutureWatcher<LoadResult>(this);
         connect(load_watcher_,&QFutureWatcher<LoadResult>::finished,this,[this]{ finish_symbol_load(); });
         open_database(initial_database_path());
@@ -736,44 +927,69 @@ private:
         settings.setValue("end_date",stock_end_->date().toString(Qt::ISODate));
     }
 
-    void refresh_saved_studies() {
-        while(auto* item=saved_studies_layout_->takeAt(0)) {
-            delete item->widget();
-            delete item;
-        }
+    void refresh_saved_studies(const QString& preferred_id={}) {
+        const auto previous_id=preferred_id.isEmpty()
+            ? saved_studies_->currentData().toString() : preferred_id;
+        const QSignalBlocker blocker(saved_studies_);
+        saved_studies_->clear();
         const auto presets=load_study_presets();
         if(presets.empty()) {
-            auto* empty=new QLabel("None yet — open Momentum to save one.");
-            empty->setEnabled(false);
-            saved_studies_layout_->addWidget(empty);
+            saved_studies_->addItem("No saved studies");
+            saved_studies_->setEnabled(false);
+            load_study_button_->setEnabled(false);
+            delete_study_button_->setEnabled(false);
             return;
         }
+        saved_studies_->setEnabled(true);
+        load_study_button_->setEnabled(true);
+        delete_study_button_->setEnabled(true);
         for(const auto& preset:presets) {
-            auto* button=new QPushButton(preset.name);
-            button->setToolTip("Load Momentum study for "+preset.symbol);
-            connect(button,&QPushButton::clicked,this,[this,id=preset.id] {
-                const auto studies=load_study_presets();
-                const auto found=std::ranges::find_if(studies,[&id](const auto& value) {
-                    return value.id==id;
-                });
-                if(found==studies.end()) {
-                    QMessageBox::warning(this,"Load Study","This saved study no longer exists.");
-                    refresh_saved_studies();
-                    return;
-                }
-                if(!found->symbol.isEmpty() && found->symbol!=stock_symbol_->currentText()) {
-                    const auto symbol_index=stock_symbol_->findText(found->symbol);
-                    if(symbol_index<0) {
-                        QMessageBox::information(this,"Load Study",
-                            "The saved ticker "+found->symbol+" has no stored IEX daily bars in this database.");
-                        return;
-                    }
-                    stock_symbol_->setCurrentIndex(symbol_index);
-                }
-                show_momentum_analysis(*found);
-            });
-            saved_studies_layout_->addWidget(button);
+            saved_studies_->addItem(preset.name+" — "+preset.symbol,preset.id);
+            saved_studies_->setItemData(saved_studies_->count()-1,
+                "Momentum study for "+preset.symbol,Qt::ToolTipRole);
         }
+        const auto previous_index=saved_studies_->findData(previous_id);
+        if(previous_index>=0) saved_studies_->setCurrentIndex(previous_index);
+    }
+
+    void load_selected_study() {
+        const auto id=saved_studies_->currentData().toString();
+        const auto studies=load_study_presets();
+        const auto found=std::ranges::find_if(studies,[&id](const auto& value) {
+            return value.id==id;
+        });
+        if(found==studies.end()) {
+            QMessageBox::warning(this,"Load Study","This saved study no longer exists.");
+            refresh_saved_studies(id);
+            return;
+        }
+        if(!found->symbol.isEmpty() && found->symbol!=stock_symbol_->currentText()) {
+            const auto symbol_index=stock_symbol_->findText(found->symbol);
+            if(symbol_index<0) {
+                QMessageBox::information(this,"Load Study",
+                    "The saved ticker "+found->symbol+" has no stored IEX daily bars in this database.");
+                return;
+            }
+            stock_symbol_->setCurrentIndex(symbol_index);
+        }
+        show_momentum_analysis(*found);
+    }
+
+    void delete_selected_study() {
+        const auto id=saved_studies_->currentData().toString();
+        const auto studies=load_study_presets();
+        const auto found=std::ranges::find_if(studies,[&id](const auto& value) {
+            return value.id==id;
+        });
+        if(found==studies.end()) {
+            refresh_saved_studies();
+            return;
+        }
+        if(QMessageBox::question(this,"Delete Saved Study",
+            "Delete the saved study \""+found->name+"\"? This cannot be undone.")!=QMessageBox::Yes)
+            return;
+        delete_study_preset(id);
+        refresh_saved_studies();
     }
 
     void show_momentum_analysis(std::optional<MomentumStudyPreset> preset=std::nullopt) {
@@ -785,9 +1001,16 @@ private:
 
         QDialog dialog(this);
         dialog.setWindowTitle("Momentum Analysis — "+symbol);
+        dialog.setWindowFlag(Qt::WindowMaximizeButtonHint,true);
+        dialog.setSizeGripEnabled(true);
+        dialog.setSizePolicy(QSizePolicy::Expanding,QSizePolicy::Expanding);
+        dialog.setMaximumSize(QWIDGETSIZE_MAX,QWIDGETSIZE_MAX);
         dialog.setMinimumSize(900,660);
-        dialog.resize(1040,760);
+        const auto available_size=dialog.screen()->availableGeometry().size();
+        dialog.resize(qMin(qMax(1040,available_size.width()*3/4),available_size.width()-40),
+                      qMin(qMax(760,available_size.height()*4/5),available_size.height()-40));
         auto* layout=new QVBoxLayout(&dialog);
+        layout->setSizeConstraint(QLayout::SetNoConstraint);
         auto* description=new QLabel(
             "For each eligible trading-day price q, this compares the price at the first trading "
             "day on or after q plus x calendar days. The skip window d controls when the next q "
@@ -799,6 +1022,10 @@ private:
 
         auto* controls_widget=new QWidget;
         auto* controls=new QFormLayout(controls_widget);
+        auto* analysis_symbol=new QComboBox;
+        for(int index=0;index<stock_symbol_->count();++index)
+            analysis_symbol->addItem(stock_symbol_->itemText(index));
+        analysis_symbol->setCurrentText(symbol);
         auto* parametric=new QCheckBox("Run a parametric study");
         auto* window_days=new QSpinBox;
         window_days->setRange(1,3650);
@@ -848,15 +1075,17 @@ private:
         };
         auto* buy_slippage=slippage_box();
         auto* sell_slippage=slippage_box();
-        auto* analysis_start=new QDateEdit(qMax(available_start_,available_end_.addYears(-1)));
-        auto* analysis_end=new QDateEdit(available_end_);
+        QDate analysis_available_start=available_start_;
+        QDate analysis_available_end=available_end_;
+        auto* analysis_start=new QDateEdit(qMax(analysis_available_start,analysis_available_end.addYears(-1)));
+        auto* analysis_end=new QDateEdit(analysis_available_end);
         analysis_start->setCalendarPopup(true); analysis_end->setCalendarPopup(true);
-        analysis_start->setDateRange(available_start_,available_end_);
-        analysis_end->setDateRange(available_start_,available_end_);
+        analysis_start->setDateRange(analysis_available_start,analysis_available_end);
+        analysis_end->setDateRange(analysis_available_start,analysis_available_end);
         auto* window_days_label=new QLabel("Comparison window (x)");
         auto* skip_days_label=new QLabel("Skip window (d)");
         auto* strike_offset_label=new QLabel("Strike offset");
-        controls->addRow("Ticker",new QLabel(symbol));
+        controls->addRow("Ticker",analysis_symbol);
         controls->addRow("Study mode",parametric);
         controls->addRow(window_days_label,window_days);
         controls->addRow(skip_days_label,skip_days);
@@ -911,8 +1140,14 @@ private:
         layout->addWidget(parameter_ranges);
 
         auto* pricing_editor=new PricingEditor;
-        pricing_editor->setVisible(false);
-        layout->addWidget(pricing_editor);
+        auto* pricing_scroll=new QScrollArea;
+        pricing_scroll->setWidget(pricing_editor);
+        pricing_scroll->setWidgetResizable(true);
+        pricing_scroll->setFrameShape(QFrame::StyledPanel);
+        pricing_scroll->setMinimumHeight(180);
+        pricing_scroll->setMaximumHeight(320);
+        pricing_scroll->setVisible(false);
+        layout->addWidget(pricing_scroll);
 
         auto* single_results=new QWidget;
         auto* results=new QFormLayout(single_results);
@@ -932,12 +1167,16 @@ private:
 
         auto* study_table=new QTableWidget(0,12);
         study_table->setHorizontalHeaderLabels(
-            {"Rank","DTE","Skip","Strike offset","Win Rate %","Avg wins",
-             "Avg losses","Avg comparisons","Avg dropped","Total profit","Profit %","Capital Needed"});
-        study_table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+            {"DTE","Skip","Strike offset","Win Rate %","Avg wins","Avg losses",
+             "Avg comparisons","Avg dropped","Total profit","Profit %","Capital Needed","Order"});
+        study_table->horizontalHeader()->setMinimumSectionSize(80);
+        study_table->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+        study_table->horizontalHeader()->setStretchLastSection(false);
+        study_table->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
         study_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
         study_table->setSelectionBehavior(QAbstractItemView::SelectRows);
         study_table->horizontalHeader()->setSortIndicatorShown(false);
+        study_table->setColumnHidden(8,true);
         study_table->setColumnHidden(9,true);
         study_table->setColumnHidden(10,true);
         study_table->setColumnHidden(11,true);
@@ -973,6 +1212,7 @@ private:
         int sort_cycle=0;
         std::vector<MomentumStudyRow> study_rows;
         std::vector<options::data::Bar> analyzed_bars;
+        QString analyzed_symbol=symbol;
         connect(study_table->horizontalHeader(),&QHeaderView::sectionClicked,&dialog,
             [=,&active_sort_column,&sort_cycle](int column) {
                 if(study_table->rowCount()==0) return;
@@ -983,7 +1223,7 @@ private:
                     sort_cycle=(sort_cycle+1)%3;
                 }
                 if(sort_cycle==0) {
-                    study_table->sortItems(0,Qt::AscendingOrder);
+                    study_table->sortItems(11,Qt::AscendingOrder);
                     study_table->horizontalHeader()->setSortIndicatorShown(false);
                     active_sort_column=-1;
                     return;
@@ -995,21 +1235,32 @@ private:
             });
 
         connect(study_table,&QTableWidget::cellDoubleClicked,&dialog,
-            [&,symbol](int row,int) {
+            [&](int row,int) {
                 if(!simulated_pricing->isChecked()) return;
                 const auto* item=study_table->item(row,0);
                 if(!item) return;
                 const auto index=item->data(Qt::UserRole).toULongLong();
                 if(index>=study_rows.size()) return;
                 const auto& value=study_rows[static_cast<std::size_t>(index)];
-                show_profit_chart(&dialog,symbol+"  x="+QString::number(value.window_days)+
+                show_profit_chart(&dialog,analyzed_symbol+"  x="+QString::number(value.window_days)+
                     " d="+QString::number(value.skip_days)+
                     " strike="+QString::number(value.strike_offset),value.result,analyzed_bars);
             });
 
-        const auto rebuild_pricing=[=] {
+        const auto expand_dialog_for=[&dialog](int minimum_width,int minimum_height) {
+            QTimer::singleShot(0,&dialog,[&dialog,minimum_width,minimum_height] {
+                const auto available=dialog.screen()->availableGeometry().size();
+                const auto hint=dialog.sizeHint();
+                const auto target_width=std::min(
+                    std::max({dialog.width(),minimum_width,hint.width()+40}),available.width()-40);
+                const auto target_height=std::min(
+                    std::max({dialog.height(),minimum_height,hint.height()+40}),available.height()-40);
+                dialog.resize(target_width,target_height);
+            });
+        };
+        const auto rebuild_pricing=[=,&expand_dialog_for] {
             if(!simulated_pricing->isChecked() || !strike_enabled->isChecked()) {
-                pricing_editor->setVisible(false);
+                pricing_scroll->setVisible(false);
                 return;
             }
             std::vector<int> offsets;
@@ -1021,7 +1272,8 @@ private:
                 offsets.push_back(strike_offset->value());
             }
             pricing_editor->set_offsets(std::move(offsets));
-            pricing_editor->setVisible(true);
+            pricing_scroll->setVisible(true);
+            expand_dialog_for(1250,820);
         };
         const auto selected_slippage_mode=[=] {
             switch(slippage_mode->currentIndex()) {
@@ -1047,6 +1299,7 @@ private:
             analyze_button->setText(enabled ? "Run Parametric Study" : "Run Analysis");
             analysis_status->clear();
             rebuild_pricing();
+            if(enabled) expand_dialog_for(1400,820);
         });
         connect(strike_enabled,&QCheckBox::toggled,&dialog,[=](bool enabled) {
             strike_width->setEnabled(enabled);
@@ -1064,9 +1317,10 @@ private:
                 (slippage_mode->currentIndex()==2 || slippage_mode->currentIndex()==3));
             sell_slippage->setEnabled(enabled &&
                 (slippage_mode->currentIndex()==1 || slippage_mode->currentIndex()==3));
+            study_table->setColumnHidden(8,!enabled);
             study_table->setColumnHidden(9,!enabled);
             study_table->setColumnHidden(10,!enabled);
-            study_table->setColumnHidden(11,!enabled);
+            study_table->setColumnHidden(11,true);
             rebuild_pricing();
         });
         connect(slippage_mode,&QComboBox::currentIndexChanged,&dialog,[=](int index) {
@@ -1076,9 +1330,37 @@ private:
         connect(strike_offset,&QSpinBox::valueChanged,&dialog,[=](int) { rebuild_pricing(); });
         connect(strike_minimum,&QSpinBox::valueChanged,&dialog,[=](int) { rebuild_pricing(); });
         connect(strike_maximum,&QSpinBox::valueChanged,&dialog,[=](int) { rebuild_pricing(); });
+        connect(analysis_symbol,&QComboBox::currentTextChanged,&dialog,
+            [&,analysis_start,analysis_end](const QString& selected_symbol) {
+                const auto range=bar_store_->date_range({selected_symbol.toStdString(),"alpaca",
+                    "iex","1Day","all","",""});
+                const auto first=QDate::fromString(QString::fromStdString(range.start),Qt::ISODate);
+                const auto last=QDate::fromString(QString::fromStdString(range.end),Qt::ISODate);
+                if(!first.isValid() || !last.isValid()) return;
+                const auto span=qMax(0,analysis_start->date().daysTo(analysis_end->date()));
+                auto selected_end=qBound(first,analysis_end->date(),last);
+                auto selected_start=selected_end.addDays(-span);
+                if(selected_start<first) {
+                    selected_start=first;
+                    selected_end=qMin(last,first.addDays(span));
+                }
+                analysis_available_start=first;
+                analysis_available_end=last;
+                const QSignalBlocker start_blocker(analysis_start);
+                const QSignalBlocker end_blocker(analysis_end);
+                analysis_start->setDateRange(first,last);
+                analysis_end->setDateRange(first,last);
+                analysis_start->setDate(selected_start);
+                analysis_end->setDate(selected_end);
+                analysis_status->setText(
+                    "Ticker changed to "+selected_symbol+". Review the parameters, then select Run.");
+            });
 
         QString loaded_study_id=preset ? preset->id : QString();
         QString loaded_study_name=preset ? preset->name : QString();
+        QString loaded_study_symbol=preset ? preset->symbol : QString();
+        QString last_result_cache_key;
+        QString last_result_settings_signature;
         if(preset) {
             window_days->setValue(preset->window_days);
             skip_days->setValue(preset->skip_days);
@@ -1096,9 +1378,9 @@ private:
             strike_minimum->setValue(preset->strike_minimum);
             strike_maximum->setValue(preset->strike_maximum);
             if(preset->analysis_start.isValid())
-                analysis_start->setDate(qBound(available_start_,preset->analysis_start,available_end_));
+                analysis_start->setDate(qBound(analysis_available_start,preset->analysis_start,analysis_available_end));
             if(preset->analysis_end.isValid())
-                analysis_end->setDate(qBound(available_start_,preset->analysis_end,available_end_));
+                analysis_end->setDate(qBound(analysis_available_start,preset->analysis_end,analysis_available_end));
             pricing_editor->set_pricing(preset->pricing);
             parametric->setChecked(preset->parametric);
             strike_enabled->setChecked(preset->strike_enabled);
@@ -1106,30 +1388,17 @@ private:
             dialog.setWindowTitle("Momentum Analysis — "+symbol+" — "+preset->name);
             analysis_status->setText("Loaded study \""+preset->name+"\". Adjust any parameters, then select Run.");
         }
-
-        connect(save_button,&QPushButton::clicked,&dialog,[&,symbol] {
-            bool accepted=false;
-            const auto proposed=QInputDialog::getText(&dialog,"Save Momentum Study","Study name:",
-                QLineEdit::Normal,loaded_study_name,&accepted).trimmed();
-            if(!accepted || proposed.isEmpty()) return;
-
-            auto id=loaded_study_id;
-            const auto studies=load_study_presets();
-            const auto same_name=std::ranges::find_if(studies,[&proposed](const auto& value) {
-                return value.name.compare(proposed,Qt::CaseInsensitive)==0;
+        connect(analysis_symbol,&QComboBox::currentTextChanged,&dialog,
+            [&,analysis_symbol](const QString& selected_symbol) {
+                dialog.setWindowTitle("Momentum Analysis — "+selected_symbol+
+                    (loaded_study_name.isEmpty() ? QString() : " — "+loaded_study_name));
             });
-            if(same_name!=studies.end() && same_name->id!=id) {
-                if(QMessageBox::question(&dialog,"Replace Saved Study",
-                    "A study named \""+same_name->name+"\" already exists. Replace it?")!=QMessageBox::Yes)
-                    return;
-                id=same_name->id;
-            }
-            if(id.isEmpty()) id=QUuid::createUuid().toString(QUuid::WithoutBraces);
 
+        const auto capture_preset=[&](const QString& name,const QString& id) {
             MomentumStudyPreset value;
             value.id=id;
-            value.name=proposed;
-            value.symbol=symbol;
+            value.name=name;
+            value.symbol=analysis_symbol->currentText();
             value.parametric=parametric->isChecked();
             value.window_days=window_days->value();
             value.skip_days=skip_days->value();
@@ -1151,12 +1420,44 @@ private:
             value.strike_minimum=strike_minimum->value();
             value.strike_maximum=strike_maximum->value();
             value.pricing=pricing_editor->all_pricing();
+            return value;
+        };
+
+        connect(save_button,&QPushButton::clicked,&dialog,[&] {
+            bool accepted=false;
+            const auto proposed=QInputDialog::getText(&dialog,"Save Momentum Study","Study name:",
+                QLineEdit::Normal,loaded_study_name,&accepted).trimmed();
+            if(!accepted || proposed.isEmpty()) return;
+
+            const auto selected_symbol=analysis_symbol->currentText();
+            auto id=!loaded_study_id.isEmpty() &&
+                    proposed.compare(loaded_study_name,Qt::CaseInsensitive)==0 &&
+                    selected_symbol.compare(loaded_study_symbol,Qt::CaseInsensitive)==0
+                ? loaded_study_id : QString();
+            const auto studies=load_study_presets();
+            const auto same_study=std::ranges::find_if(studies,[&](const auto& value) {
+                return value.name.compare(proposed,Qt::CaseInsensitive)==0 &&
+                    value.symbol.compare(selected_symbol,Qt::CaseInsensitive)==0;
+            });
+            if(same_study!=studies.end() && same_study->id!=id) {
+                if(QMessageBox::question(&dialog,"Replace Saved Study",
+                    "A study named \""+same_study->name+"\" already exists for "+
+                        selected_symbol+". Replace it?")!=QMessageBox::Yes)
+                    return;
+                id=same_study->id;
+            }
+            if(id.isEmpty()) id=QUuid::createUuid().toString(QUuid::WithoutBraces);
+
+            auto value=capture_preset(proposed,id);
+            if(momentum_settings_signature(value)==last_result_settings_signature)
+                value.result_cache_key=last_result_cache_key;
             save_study_preset(value);
             loaded_study_id=id;
             loaded_study_name=proposed;
-            dialog.setWindowTitle("Momentum Analysis — "+symbol+" — "+proposed);
+            loaded_study_symbol=selected_symbol;
+            dialog.setWindowTitle("Momentum Analysis — "+value.symbol+" — "+proposed);
             analysis_status->setText("Saved study \""+proposed+"\".");
-            refresh_saved_studies();
+            refresh_saved_studies(id);
         });
 
         auto* analysis_watcher=new QFutureWatcher<MomentumAnalysisOutput>(&dialog);
@@ -1170,21 +1471,29 @@ private:
             analysis_activity->setVisible(busy);
         };
         connect(analysis_watcher,&QFutureWatcher<MomentumAnalysisOutput>::finished,&dialog,
-            [&,symbol,set_busy,analysis_watcher] {
+            [&,set_busy,analysis_watcher] {
                 set_busy(false);
                 auto output=analysis_watcher->result();
                 if(!output.error.isEmpty()) {
                     analysis_status->setText("Analysis failed: "+output.error);
                     return;
                 }
+                if(output.cache_miss) {
+                    analysis_status->setText(
+                        "No valid cached result is available for this saved study. Select Run to analyze it.");
+                    return;
+                }
+                last_result_cache_key=output.cache_key;
+                last_result_settings_signature=output.settings_signature;
                 if(output.parametric) {
                     study_rows=std::move(output.study_rows);
                     active_sort_column=-1;
                     sort_cycle=0;
                     study_table->horizontalHeader()->setSortIndicatorShown(false);
+                    study_table->setColumnHidden(8,!output.simulated_pricing);
                     study_table->setColumnHidden(9,!output.simulated_pricing);
                     study_table->setColumnHidden(10,!output.simulated_pricing);
-                    study_table->setColumnHidden(11,!output.simulated_pricing);
+                    study_table->setColumnHidden(11,true);
                     study_table->setUpdatesEnabled(false);
                     study_table->setRowCount(static_cast<int>(study_rows.size()));
                     std::vector<std::size_t> comparison_rank(study_rows.size());
@@ -1197,7 +1506,7 @@ private:
                     comparison_rank.resize(qMin<std::size_t>(10,comparison_rank.size()));
                     for(int row=0;row<static_cast<int>(study_rows.size());++row) {
                         const auto& value=study_rows[static_cast<std::size_t>(row)];
-                        const QString cells[]{QString::number(row+1),QString::number(value.window_days),
+                        const QString cells[]{QString::number(value.window_days),
                             QString::number(value.skip_days),output.strike_enabled
                                 ? QString::number(value.strike_offset) : "Off",
                             QString::number(value.result.win_percentage,'f',2)+"%",
@@ -1205,13 +1514,13 @@ private:
                             averaged_count(value.result.comparisons),averaged_count(value.result.dropped_comparisons),
                             "$"+QString::number(value.result.total_profit,'f',2),
                             QString::number(value.result.profit_percentage,'f',2)+"%",
-                            "$"+QString::number(value.result.required_capital,'f',2)};
-                        const double numeric_values[]{static_cast<double>(row+1),
-                            static_cast<double>(value.window_days),static_cast<double>(value.skip_days),
+                            "$"+QString::number(value.result.required_capital,'f',2),QString::number(row)};
+                        const double numeric_values[]{static_cast<double>(value.window_days),
+                            static_cast<double>(value.skip_days),
                             static_cast<double>(value.strike_offset),value.result.win_percentage,
                             value.result.wins,value.result.losses,value.result.comparisons,
                             value.result.dropped_comparisons,value.result.total_profit,value.result.profit_percentage,
-                            value.result.required_capital};
+                            value.result.required_capital,static_cast<double>(row)};
                         const auto highlight=std::ranges::find(
                             comparison_rank,static_cast<std::size_t>(row))!=comparison_rank.end();
                         for(int column=0;column<12;++column) {
@@ -1223,7 +1532,8 @@ private:
                     }
                     study_table->setUpdatesEnabled(true);
                     analysis_status->setText(
-                        "Generated "+QString::number(study_rows.size())+
+                        (output.from_cache ? "Loaded cached results for " : "Generated ")+
+                        QString::number(study_rows.size())+
                         " parameter combinations. Click a header to sort"+
                         (output.simulated_pricing
                             ? "; double-click a row to view its cumulative profit chart." : "."));
@@ -1242,24 +1552,33 @@ private:
                 dropped->setText(averaged_count(result.dropped_comparisons));
                 analysis_status->setText(result.comparisons==0
                     ? "The selected analysis range is too short for this comparison window."
-                    : QString());
-                if(output.simulated_pricing && result.comparisons!=0)
-                    show_profit_chart(&dialog,symbol+"  x="+QString::number(output.window_days)+
+                    : output.from_cache ? "Loaded cached analysis result." : QString());
+                if(output.open_profit_chart && output.simulated_pricing && result.comparisons!=0)
+                    show_profit_chart(&dialog,output.symbol+"  x="+QString::number(output.window_days)+
                         " d="+QString::number(output.skip_days)+
                         " strike="+QString::number(output.strike_offset),result,analyzed_bars);
             });
 
-        const auto analyze=[&,symbol,set_busy,analysis_watcher] {
+        const auto analyze=[&,set_busy,analysis_watcher](bool cache_only) {
             if(analysis_watcher->isRunning()) return;
             if(analysis_start->date()>analysis_end->date()) {
                 analysis_status->setText("The analysis start must not be after the end.");
                 return;
             }
             try {
-                analyzed_bars=bar_store_->load({symbol.toStdString(),"alpaca","iex","1Day","all",
+                const auto run_symbol=analysis_symbol->currentText();
+                analyzed_symbol=run_symbol;
+                analyzed_bars=bar_store_->load({run_symbol.toStdString(),"alpaca","iex","1Day","all",
                     analysis_start->date().toString(Qt::ISODate).toStdString(),
                     analysis_end->date().toString(Qt::ISODate).toStdString()});
+                const auto current_preset=capture_preset({},{});
+                const auto settings_signature=momentum_settings_signature(current_preset);
+                const auto cache_key=momentum_cache_key(current_preset,analyzed_bars);
                 MomentumAnalysisOutput output;
+                output.symbol=run_symbol;
+                output.cache_key=cache_key;
+                output.settings_signature=settings_signature;
+                output.open_profit_chart=!cache_only;
                 output.parametric=parametric->isChecked();
                 output.strike_enabled=strike_enabled->isChecked();
                 output.simulated_pricing=simulated_pricing->isChecked();
@@ -1330,12 +1649,26 @@ private:
                 }
                 const auto request_count=requests.size();
                 const auto rate=drop_rate->value();
-                analysis_status->setText(output.parametric
-                    ? "Analyzing "+QString::number(request_count)+" parameter combinations…"
-                    : "Running analysis…");
+                analysis_status->setText(cache_only ? "Loading saved analysis results…" :
+                    output.parametric
+                        ? "Checking the cache, then analyzing "+QString::number(request_count)+
+                            " parameter combinations if needed…"
+                        : "Checking the cache, then running the analysis if needed…");
                 set_busy(true);
                 analysis_watcher->setFuture(QtConcurrent::run(
-                    [bars=analyzed_bars,requests=std::move(requests),rate,output=std::move(output)]() mutable {
+                    [bars=analyzed_bars,requests=std::move(requests),rate,cache_only,
+                     output=std::move(output)]() mutable {
+                        if(auto cached=load_cached_analysis(output.cache_key)) {
+                            cached->output.cache_key=output.cache_key;
+                            cached->output.settings_signature=output.settings_signature;
+                            cached->output.from_cache=true;
+                            cached->output.open_profit_chart=output.open_profit_chart;
+                            return std::move(cached->output);
+                        }
+                        if(cache_only) {
+                            output.cache_miss=true;
+                            return output;
+                        }
                         try {
                             if(output.parametric) {
                                 output.study_rows.reserve(requests.size());
@@ -1356,6 +1689,7 @@ private:
                         } catch(const std::exception& error) {
                             output.error=QString::fromUtf8(error.what());
                         }
+                        if(output.error.isEmpty()) save_cached_analysis(output.cache_key,output,bars);
                         return output;
                     }));
             } catch(const std::exception& error) {
@@ -1363,8 +1697,9 @@ private:
                 analysis_status->setText("Analysis failed: "+QString::fromUtf8(error.what()));
             }
         };
-        connect(analyze_button,&QPushButton::clicked,&dialog,analyze);
-        if(!preset) analyze();
+        connect(analyze_button,&QPushButton::clicked,&dialog,[&analyze] { analyze(false); });
+        if(preset) analyze(true);
+        else analyze(false);
         dialog.exec();
     }
 
@@ -1481,7 +1816,8 @@ private:
     QDateEdit *stock_start_{},*stock_end_{};
     QDate available_start_,available_end_;
     TimelineChartView* stock_chart_view_{};
-    QHBoxLayout* saved_studies_layout_{};
+    QComboBox* saved_studies_{};
+    QPushButton *load_study_button_{},*delete_study_button_{};
     QLineEdit* load_symbol_{};
     QDateEdit *load_start_{},*load_end_{};
     QPushButton* load_button_{};

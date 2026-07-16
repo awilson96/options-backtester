@@ -192,14 +192,32 @@ tie, and total comparison counts. Both windows and the analysis date range are
 configurable.
 
 Select **Save Study…** in the Momentum dialog to store a named preset. Saved
-studies appear as buttons above the chart on the **Underlying Price** page. A
-saved-study button selects its associated ticker and opens Momentum with its
+studies appear in a dropdown above the chart on the **Underlying Price** page.
+Choose a study and select **Load** to select its associated ticker and open Momentum with its
 single or parametric ranges, analysis dates, strike settings, simulated pricing,
 allocation, drop rate, and slippage restored. Loading only fills the dialog; it
 does not run the analysis until **Run Analysis** or **Run Parametric Study** is
-selected. Presets use a versioned field-based format, so parameters introduced by
+selected. Select **Delete** to remove the chosen preset after confirming the
+action. The ticker is editable from a dropdown inside the study dialog. Changing
+it preserves the analysis period where possible, clamps the dates to the new
+symbol's stored history, and leaves the other strategy parameters in place. Saving
+with the loaded study's existing name updates it; saving under a different name
+creates a new preset so the original can continue serving as a template. Presets
+with the same name but different symbols are also stored separately; replacement
+is only offered when both the name and symbol match. Presets use a versioned
+field-based format, so parameters introduced by
 future releases can use their defaults when an older study is loaded and can then
 be adjusted before running or saving again.
+
+Completed analyses are cached persistently with their full single result or
+parametric table, statistics, profit curves, and underlying daily bars. Saving a
+study associates its unchanged parameter snapshot with that cached result, so a
+valid saved study restores its results immediately when loaded and does not open a
+profit-chart popup until requested by running or selecting a table row. Selecting
+Run with unchanged inputs also reuses the cache. Cache keys include every strategy
+parameter, simulated-pricing value, ticker, date range, and the complete market-data
+snapshot; changing any of them automatically requires a fresh analysis. Identical
+templates may share a cached result even when saved under different names.
 
 Momentum uses each daily bar's VWAP as the analysis price, falling back to close
 only when VWAP is unavailable. **Drop rate** is a fixed, non-parametric percentage
@@ -236,7 +254,8 @@ profit and percentage profit appear in parametric results; percentage profit is
 row to open its simulated account-value chart. A non-parametric analysis opens its
 chart immediately. Account curves and totals are averaged across skip-window start
 phases in the same way as the momentum statistics. Parametric table headers use
-**DTE**, **Skip**, and **Win Rate %**, and omit the average-ties column.
+**DTE**, **Skip**, and **Win Rate %**, omit the average-ties and Rank columns, and
+use the table's built-in row numbers for the current rank.
 
 Simulated pricing also supports fixed slippage on neither side, the buy only, the
 sell only, or both buy and sell. Buy and sell slippage have independent inputs and
@@ -271,6 +290,12 @@ warnings. While a study is running, the dialog shows an animated activity
 indicator and the number of parameter combinations being evaluated. Parameter,
 save, and run controls are temporarily locked so the displayed results always
 correspond to the exact settings captured at the start of the run.
+
+The Momentum dialog opens at a screen-aware size, can be maximized or expanded
+without an application-imposed maximum width, and automatically grows when
+parametric or simulated-pricing controls need additional room. Result columns keep
+readable widths and scroll horizontally when necessary, while large collections
+of strike-pricing inputs scroll vertically instead of compressing other fields.
 
 The **Load Data** tab downloads IEX daily bars for a new symbol into the currently
 open database using `ALPACA_API_KEY` and `ALPACA_API_SECRET`. Its date selectors
