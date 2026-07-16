@@ -148,6 +148,8 @@ struct MomentumStudyPreset {
     bool parametric{};
     int window_days{30};
     int skip_days{1};
+    int bar_minutes{1};
+    QString price_field{"vwap"};
     double drop_rate{};
     bool strike_enabled{};
     double strike_width{5.0};
@@ -184,6 +186,8 @@ std::vector<MomentumStudyPreset> load_study_presets() {
             value.parametric=settings.value("parametric",false).toBool();
             value.window_days=settings.value("window_days",30).toInt();
             value.skip_days=settings.value("skip_days",1).toInt();
+            value.bar_minutes=settings.value("bar_minutes",1).toInt();
+            value.price_field=settings.value("price_field","vwap").toString();
             value.drop_rate=settings.value("drop_rate",0.0).toDouble();
             value.strike_enabled=settings.value("strike_enabled",false).toBool();
             value.strike_width=settings.value("strike_width",5.0).toDouble();
@@ -228,13 +232,15 @@ void save_study_preset(const MomentumStudyPreset& value) {
     settings.beginGroup("saved_studies");
     settings.beginGroup(value.id);
     settings.remove("");
-    settings.setValue("schema_version",4);
+    settings.setValue("schema_version",5);
     settings.setValue("strategy","momentum");
     settings.setValue("name",value.name);
     settings.setValue("symbol",value.symbol);
     settings.setValue("parametric",value.parametric);
     settings.setValue("window_days",value.window_days);
     settings.setValue("skip_days",value.skip_days);
+    settings.setValue("bar_minutes",value.bar_minutes);
+    settings.setValue("price_field",value.price_field);
     settings.setValue("drop_rate",value.drop_rate);
     settings.setValue("strike_enabled",value.strike_enabled);
     settings.setValue("strike_width",value.strike_width);
@@ -434,7 +440,8 @@ QByteArray momentum_preset_bytes(const MomentumStudyPreset& value) {
     QDataStream stream(&bytes,QIODevice::WriteOnly);
     stream.setVersion(QDataStream::Qt_6_0);
     stream<<saved_result_version<<value.symbol<<value.parametric<<value.window_days
-          <<value.skip_days<<value.drop_rate<<value.strike_enabled<<value.strike_width
+          <<value.skip_days<<value.bar_minutes<<value.price_field
+          <<value.drop_rate<<value.strike_enabled<<value.strike_width
           <<value.strike_resolution
           <<value.strike_offset<<value.simulated_pricing<<value.allocation<<value.slippage_mode
           <<value.buy_slippage<<value.sell_slippage<<value.analysis_start<<value.analysis_end
@@ -1292,6 +1299,53 @@ std::vector<ChartCandle> aggregate_chart_candles(
     return result;
 }
 
+std::vector<options::data::Bar> aggregate_regular_bars(
+    std::span<const options::data::Bar> bars,int minutes) {
+    std::vector<options::data::Bar> result;
+    std::vector<long double> vwap_numerators;
+    std::vector<long double> vwap_weights;
+    const QTime market_open(9,30);
+    for(const auto& source:bars) {
+        const auto timestamp=eastern_timestamp(source);
+        if(!is_regular_market_bar(timestamp)) continue;
+        const auto bucket_time=minutes==0 ? market_open : market_open.addSecs(
+            (market_open.secsTo(timestamp.time())/60/minutes)*minutes*60);
+        const QDateTime bucket(timestamp.date(),bucket_time,eastern_time_zone());
+        const auto bucket_text=bucket.toUTC().toString(Qt::ISODateWithMs).toStdString();
+        const auto weight=static_cast<long double>(source.volume>0 ? source.volume : 1);
+        if(result.empty() || result.back().timestamp!=bucket_text) {
+            auto bar=source;
+            bar.timestamp=bucket_text;
+            result.push_back(std::move(bar));
+            vwap_numerators.push_back(static_cast<long double>(source.vwap)*weight);
+            vwap_weights.push_back(weight);
+            continue;
+        }
+        auto& bar=result.back();
+        bar.high=std::max(bar.high,source.high);
+        bar.low=std::min(bar.low,source.low);
+        bar.close=source.close;
+        bar.volume+=source.volume;
+        bar.trade_count+=source.trade_count;
+        vwap_numerators.back()+=static_cast<long double>(source.vwap)*weight;
+        vwap_weights.back()+=weight;
+        bar.vwap=static_cast<double>(vwap_numerators.back()/vwap_weights.back());
+    }
+    return result;
+}
+
+double analysis_price(const options::data::Bar& bar,const QString& field) {
+    if(field=="open") return bar.open;
+    if(field=="high") return bar.high;
+    if(field=="low") return bar.low;
+    if(field=="close") return bar.close;
+    return std::isfinite(bar.vwap) && bar.vwap>0.0 ? bar.vwap : bar.close;
+}
+
+void select_analysis_price(std::span<options::data::Bar> bars,const QString& field) {
+    for(auto& bar:bars) bar.vwap=analysis_price(bar,field);
+}
+
 class TimelineChartView final : public QChartView {
 public:
     explicit TimelineChartView(std::function<void(int)> shift_window)
@@ -1701,11 +1755,11 @@ private:
         auto* layout=new QVBoxLayout(&dialog);
         layout->setSizeConstraint(QLayout::SetNoConstraint);
         auto* description=new QLabel(
-            "For each eligible one-minute price q, this compares the price at the first stored bar "
+            "For each eligible aggregated-bar price q, this compares the price at the first stored bar "
             "at or after q's timestamp plus x calendar days. The skip window d controls when the next q "
             "becomes eligible. Results are averaged across all d possible start phases. Optional "
             "strike adjustment compares r with a strike-grid price derived from q instead of q itself. "
-            "Each one-minute bar's VWAP is used when available, with close as a fallback.");
+            "The data resolution and OHLC/VWAP analysis field are selectable below.");
         description->setWordWrap(true);
         layout->addWidget(description);
 
@@ -1716,6 +1770,20 @@ private:
             analysis_symbol->addItem(stock_symbol_->itemText(index));
         analysis_symbol->setCurrentText(symbol);
         auto* parametric=new QCheckBox("Run a parametric study");
+        auto* bar_resolution=new QComboBox;
+        bar_resolution->addItem("1 Day",0);
+        bar_resolution->addItem("1 Hour",60);
+        bar_resolution->addItem("30 Min",30);
+        bar_resolution->addItem("15 Min",15);
+        bar_resolution->addItem("5 Min",5);
+        bar_resolution->addItem("1 Min",1);
+        auto* price_field=new QComboBox;
+        price_field->addItem("Open","open");
+        price_field->addItem("Close","close");
+        price_field->addItem("High","high");
+        price_field->addItem("Low","low");
+        price_field->addItem("VWAP","vwap");
+        price_field->setCurrentIndex(price_field->findData("vwap"));
         auto* window_days=new QSpinBox;
         window_days->setRange(1,3650);
         window_days->setValue(30);
@@ -1782,12 +1850,14 @@ private:
         auto* strike_offset_label=new QLabel("Strike offset");
         controls->addRow("Ticker",analysis_symbol);
         controls->addRow("Study mode",parametric);
+        controls->addRow("Data resolution",bar_resolution);
+        controls->addRow("Analysis price",price_field);
         controls->addRow(window_days_label,window_days);
         controls->addRow(skip_days_label,skip_days);
         controls->addRow("Drop rate",drop_rate);
         controls->addRow("Strike analysis",strike_enabled);
         controls->addRow("Strike width",strike_width);
-        controls->addRow("Resolution",strike_resolution);
+        controls->addRow("Strike resolution",strike_resolution);
         controls->addRow(strike_offset_label,strike_offset);
         controls->addRow("Pseudo-backtest",simulated_pricing);
         controls->addRow("Trading allocation",allocation);
@@ -1997,6 +2067,8 @@ private:
                     ? value.strike_adjustment->width : 0.0;
                 const auto title=analyzed_symbol+"  DTE="+QString::number(value.window_days)+
                     " skip="+QString::number(value.skip_days)+
+                    " data="+bar_resolution->currentText()+
+                    " price="+price_field->currentText()+
                     " res="+QString::number(resolution,'f',2)+
                     " strike_width="+QString::number(width,'f',2)+
                     " strike_offset="+QString::number(value.strike_offset);
@@ -2065,6 +2137,22 @@ private:
             default: return options::analysis::SlippageMode::none;
             }
         };
+
+        bool study_resolution_overridden=false;
+        const auto select_default_study_resolution=[=] {
+            const auto minutes=analysis_start->date()<analysis_end->date() ? 0 : 1;
+            const auto index=bar_resolution->findData(minutes);
+            if(index>=0) bar_resolution->setCurrentIndex(index);
+        };
+        select_default_study_resolution();
+        connect(bar_resolution,&QComboBox::activated,&dialog,
+            [&study_resolution_overridden](int) { study_resolution_overridden=true; });
+        const auto study_dates_changed=[&study_resolution_overridden,
+            select_default_study_resolution](QDate) {
+            if(!study_resolution_overridden) select_default_study_resolution();
+        };
+        connect(analysis_start,&QDateEdit::dateChanged,&dialog,study_dates_changed);
+        connect(analysis_end,&QDateEdit::dateChanged,&dialog,study_dates_changed);
 
         connect(parametric,&QCheckBox::toggled,&dialog,[=](bool enabled) {
             window_days_label->setVisible(!enabled);
@@ -2146,6 +2234,11 @@ private:
         QString last_result_settings_signature;
         std::optional<MomentumAnalysisOutput> last_analysis_result;
         if(preset) {
+            study_resolution_overridden=true;
+            const auto bar_index=bar_resolution->findData(preset->bar_minutes);
+            if(bar_index>=0) bar_resolution->setCurrentIndex(bar_index);
+            const auto price_index=price_field->findData(preset->price_field);
+            if(price_index>=0) price_field->setCurrentIndex(price_index);
             window_days->setValue(preset->window_days);
             skip_days->setValue(preset->skip_days);
             drop_rate->setValue(preset->drop_rate);
@@ -2187,6 +2280,8 @@ private:
             value.parametric=parametric->isChecked();
             value.window_days=window_days->value();
             value.skip_days=skip_days->value();
+            value.bar_minutes=bar_resolution->currentData().toInt();
+            value.price_field=price_field->currentData().toString();
             value.drop_rate=drop_rate->value();
             value.strike_enabled=strike_enabled->isChecked();
             value.strike_width=strike_width->value();
@@ -2389,7 +2484,8 @@ private:
                 if(open_chart)
                     show_profit_chart(&dialog,output.symbol+"  DTE="+
                         QString::number(output.window_days)+" skip="+
-                        QString::number(output.skip_days)+" res="+
+                        QString::number(output.skip_days)+" data="+
+                        bar_resolution->currentText()+" price="+price_field->currentText()+" res="+
                         QString::number(output.strike_resolution,'f',2)+" strike_width="+
                         QString::number(output.strike_width,'f',2)+" strike_offset="+
                         QString::number(output.strike_offset),result,analyzed_bars);
@@ -2405,10 +2501,18 @@ private:
             try {
                 const auto run_symbol=analysis_symbol->currentText();
                 analyzed_symbol=run_symbol;
-                analyzed_bars=bar_store_->load({run_symbol.toStdString(),"alpaca","iex",
+                const auto source_bars=bar_store_->load({run_symbol.toStdString(),"alpaca","iex",
                     options::data::stock_bar_timeframe,"all",
                     analysis_start->date().toString(Qt::ISODate).toStdString(),
                     analysis_end->date().toString(Qt::ISODate).toStdString()});
+                analyzed_bars=aggregate_regular_bars(
+                    source_bars,bar_resolution->currentData().toInt());
+                select_analysis_price(analyzed_bars,price_field->currentData().toString());
+                if(analyzed_bars.empty()) {
+                    analysis_status->setText(
+                        "No regular-session bars are available for the selected range.");
+                    return;
+                }
                 const auto current_preset=capture_preset({},{});
                 const auto settings_signature=momentum_settings_signature(current_preset);
                 const auto result_key=load_saved && preset

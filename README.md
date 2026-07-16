@@ -233,23 +233,29 @@ be adjusted before running or saving again.
 
 Selecting **Save Study…** stores the study parameters and, when those exact
 settings have just been run, the completed single result or parametric table,
-summary statistics, and underlying one-minute bars. Single-result studies retain their
+summary statistics, and underlying aggregated bars. Single-result studies retain their
 chart data, while parametric studies save summaries only. A saved study restores that
 result when explicitly loaded and does not open a profit-chart popup until a table
 row is selected. Pressing **Run Analysis** always performs a fresh calculation;
 there is no automatic result-cache lookup or reuse. If the displayed parameters
 have not been run, only the study template is saved.
 
-Momentum uses each one-minute bar's VWAP as the analysis price, falling back to close
-only when VWAP is unavailable. **Drop rate** is a fixed, non-parametric percentage
+Momentum defaults to VWAP as the analysis price, falling back to close only when
+VWAP is unavailable. The Momentum dialog can aggregate regular-session data into
+**1 Day**, **1 Hour**, **30 Min**, **15 Min**, **5 Min**, or **1 Min** bars and analyze
+each bar's **Open**, **Close**, **High**, **Low**, or **VWAP**. Multi-day studies
+default to daily data and single-day studies default to one-minute data. Intraday
+buckets are anchored at 9:30 a.m. Eastern; VWAP is volume-weighted when bars are
+aggregated. These selections are saved with study presets and included in result
+signatures. **Drop rate** is a fixed, non-parametric percentage
 of otherwise eligible entries treated as unfillable. Dropped entries are selected
 using five reproducible pseudo-random symbol/timestamp scenarios per strategy row. Table
 statistics use the scenario with median total profit. Profit charts show the high
 scenario in green, low in red, median in black, and a zero-drop baseline as a blue
 dotted line. Hovering over a profit chart displays a vertical date guide and a
 pastel-grey summary containing the date plus the no-drop, high, low, and median
-account values at that position. The underlying asset's one-minute analysis price is
-drawn in very light grey against a separate price axis on the right. It shares the
+account values at that position. The underlying asset's selected aggregated analysis
+price is drawn in very light grey against a separate price axis on the right. It shares the
 chart's date axis but cannot change the account-value scale on the left. No
 additional scenario columns are added to the parametric table.
 
