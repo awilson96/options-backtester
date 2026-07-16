@@ -143,7 +143,7 @@ MomentumResult analyze_momentum(
         }
 
         MomentumResult phase_result;
-        const auto record_trade=[&](const ScheduledTrade& trade) {
+        const auto record_trade=[&](const ScheduledTrade& trade,double money_at_risk=0.0) {
             ++phase_result.comparisons;
             if(trade.outcome==Outcome::win) ++phase_result.wins;
             else if(trade.outcome==Outcome::loss) ++phase_result.losses;
@@ -159,7 +159,8 @@ MomentumResult analyze_momentum(
                 phase_result.trades.push_back({
                     start.date.toString(Qt::ISODate).toStdString(),
                     end.date.toString(Qt::ISODate).toStdString(),start.price,end.price,
-                    comparison_price(start.price,strike_adjustment),trade.profit,phase,trade_result});
+                    comparison_price(start.price,strike_adjustment),trade.profit,phase,trade_result,
+                    money_at_risk});
             }
         };
         if(!simulated_pricing) {
@@ -205,7 +206,7 @@ MomentumResult analyze_momentum(
                 }
                 reserved_capital+=risk;
                 funded_open.push_back(&trade);
-                record_trade(trade);
+                record_trade(trade,reserved_capital);
             }
             while(!funded_open.empty()) {
                 close_position(*funded_open.front());
@@ -224,6 +225,12 @@ MomentumResult analyze_momentum(
             std::make_move_iterator(phase_result.trades.begin()),
             std::make_move_iterator(phase_result.trades.end()));
     }
+    if(collect_trades)
+        std::ranges::stable_sort(result.trades,[](const auto& left,const auto& right) {
+            if(left.start_date!=right.start_date) return left.start_date<right.start_date;
+            if(left.end_date!=right.end_date) return left.end_date<right.end_date;
+            return left.phase<right.phase;
+        });
     const auto phases=static_cast<double>(skip_days);
     result.comparisons/=phases;
     result.skipped_comparisons/=phases;

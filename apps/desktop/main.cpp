@@ -109,6 +109,8 @@ struct MomentumAnalysisOutput {
     int window_days{};
     int skip_days{};
     int strike_offset{};
+    double strike_width{};
+    double strike_resolution{};
     std::vector<MomentumStudyRow> study_rows;
     std::optional<options::analysis::MomentumResult> single_result;
     QString error;
@@ -1022,9 +1024,9 @@ void show_profit_chart(QWidget* parent,const QString& title,
         auto* ledger_label=new QLabel(
             "Median-scenario executed trades — phase identifies the skip-window start schedule");
         ledger_layout->addWidget(ledger_label);
-        auto* ledger=new LedgerTableWidget(static_cast<int>(result.trades.size()),8);
+        auto* ledger=new LedgerTableWidget(static_cast<int>(result.trades.size()),9);
         ledger->setHorizontalHeaderLabels({"Start date","End date","Start price","End price",
-            "Comparison price","Result","Phase","Contract P/L"});
+            "Comparison price","Result","Phase","Contract P/L","Money currently at risk"});
         ledger->setEditTriggers(QAbstractItemView::NoEditTriggers);
         ledger->setSelectionBehavior(QAbstractItemView::SelectRows);
         ledger->setAlternatingRowColors(true);
@@ -1048,6 +1050,8 @@ void show_profit_chart(QWidget* parent,const QString& title,
                 QString::number(trade.phase+1),static_cast<double>(trade.phase+1)));
             ledger->setItem(row,7,new NumericTableWidgetItem(
                 "$"+QString::number(trade.profit,'f',2),trade.profit));
+            ledger->setItem(row,8,new NumericTableWidgetItem(
+                "$"+QString::number(trade.money_at_risk,'f',2),trade.money_at_risk));
         }
         ledger->set_row_hover_callback([view,&result](std::optional<int> row) {
             if(!row || *row<0 || *row>=static_cast<int>(result.trades.size())) {
@@ -1810,9 +1814,15 @@ private:
                 if(index>=study_rows.size()) return;
                 const auto& value=study_rows[static_cast<std::size_t>(index)];
                 if(!value.simulated_pricing) return;
-                const auto title=analyzed_symbol+"  x="+QString::number(value.window_days)+
-                    " d="+QString::number(value.skip_days)+
-                    " strike="+QString::number(value.strike_offset);
+                const auto resolution=value.strike_adjustment
+                    ? value.strike_adjustment->resolution : 0.0;
+                const auto width=value.strike_adjustment
+                    ? value.strike_adjustment->width : 0.0;
+                const auto title=analyzed_symbol+"  DTE="+QString::number(value.window_days)+
+                    " skip="+QString::number(value.skip_days)+
+                    " res="+QString::number(resolution,'f',2)+
+                    " strike_width="+QString::number(width,'f',2)+
+                    " strike_offset="+QString::number(value.strike_offset);
                 if(!value.result.trades.empty()) {
                     show_profit_chart(&dialog,title,value.result,analyzed_bars);
                     return;
@@ -2200,9 +2210,12 @@ private:
                     output.open_profit_chart && output.simulated_pricing && result.comparisons!=0;
                 set_busy(false);
                 if(open_chart)
-                    show_profit_chart(&dialog,output.symbol+"  x="+QString::number(output.window_days)+
-                        " d="+QString::number(output.skip_days)+
-                        " strike="+QString::number(output.strike_offset),result,analyzed_bars);
+                    show_profit_chart(&dialog,output.symbol+"  DTE="+
+                        QString::number(output.window_days)+" skip="+
+                        QString::number(output.skip_days)+" res="+
+                        QString::number(output.strike_resolution,'f',2)+" strike_width="+
+                        QString::number(output.strike_width,'f',2)+" strike_offset="+
+                        QString::number(output.strike_offset),result,analyzed_bars);
                 last_analysis_result=std::move(output);
             });
 
@@ -2234,6 +2247,8 @@ private:
                 output.window_days=window_days->value();
                 output.skip_days=skip_days->value();
                 output.strike_offset=strike_offset->value();
+                output.strike_width=strike_width->value();
+                output.strike_resolution=strike_resolution->value();
                 std::vector<MomentumStudyRequest> requests;
                 if(output.parametric) {
                     if(window_minimum->value()>window_maximum->value() ||

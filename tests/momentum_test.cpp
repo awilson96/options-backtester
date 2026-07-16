@@ -135,6 +135,7 @@ TEST_CASE("momentum generates an executed trade ledger only when requested") {
     REQUIRE(with_ledger.trades.front().end_price==11);
     REQUIRE(with_ledger.trades.front().result==
         options::analysis::MomentumResult::TradeResult::itm);
+    REQUIRE(with_ledger.trades.front().money_at_risk==300);
     REQUIRE(with_ledger.trades.back().result==
         options::analysis::MomentumResult::TradeResult::otm);
 }
@@ -204,13 +205,21 @@ TEST_CASE("momentum reserves max loss and skips unfunded overlapping trades") {
         {"TEST","2024-01-05T00:00:00Z",0,0,0,11},
     };
     const auto result=options::analysis::analyze_momentum(bars,3,1,std::nullopt,
-        options::analysis::SimulatedPricing{200,300,300});
+        options::analysis::SimulatedPricing{200,300,300},0,0,true);
     REQUIRE(result.required_capital==600);
     REQUIRE(result.comparisons==1);
     REQUIRE(result.skipped_comparisons==1);
     REQUIRE(result.wins==1);
     REQUIRE(result.total_profit==200);
     REQUIRE(result.ending_balance==500);
+    REQUIRE(result.trades.size()==1);
+    REQUIRE(result.trades.front().money_at_risk==300);
+
+    const auto fully_funded=options::analysis::analyze_momentum(bars,3,1,std::nullopt,
+        options::analysis::SimulatedPricing{200,300,600},0,0,true);
+    REQUIRE(fully_funded.trades.size()==2);
+    REQUIRE(fully_funded.trades.front().money_at_risk==300);
+    REQUIRE(fully_funded.trades.back().money_at_risk==600);
 }
 
 TEST_CASE("momentum required capital includes losses before later entries") {

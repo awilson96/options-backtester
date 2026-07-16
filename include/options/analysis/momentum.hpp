@@ -26,6 +26,7 @@ struct MomentumResult {
         double profit{};
         std::size_t phase{};
         TradeResult result{TradeResult::atm};
+        double money_at_risk{};
     };
     double comparisons{};
     double skipped_comparisons{};
