@@ -3,6 +3,7 @@
 #include "options/providers/alpaca/alpaca_client.hpp"
 
 #include <QApplication>
+#include <QAbstractTableModel>
 #include <QBrush>
 #include <QChart>
 #include <QChartView>
@@ -43,6 +44,7 @@
 #include <QSplitter>
 #include <QTabWidget>
 #include <QTableWidget>
+#include <QTableView>
 #include <QThread>
 #include <QTimer>
 #include <QStandardPaths>
@@ -110,11 +112,11 @@ struct MomentumAnalysisOutput {
     std::vector<MomentumStudyRow> study_rows;
     std::optional<options::analysis::MomentumResult> single_result;
     QString error;
-    QString cache_key;
+    QString saved_result_key;
     QString settings_signature;
-    bool from_cache{};
+    bool loaded_saved_result{};
     bool open_profit_chart{};
-    bool cache_miss{};
+    bool saved_result_missing{};
 };
 
 struct MomentumLedgerOutput {
@@ -127,8 +129,8 @@ struct MomentumLedgerOutput {
 
 struct AnalysisProgress {
     std::atomic<std::size_t> completed{};
-    std::atomic<bool> calculating{};
-    std::size_t total{};
+    std::atomic<int> phase{}; // 0 opening, 1 calculation, 2 saving, 3 parallel load
+    std::atomic<std::size_t> total{};
 };
 
 struct MomentumStudyPreset {
@@ -141,6 +143,7 @@ struct MomentumStudyPreset {
     double drop_rate{};
     bool strike_enabled{};
     double strike_width{5.0};
+    double strike_resolution{1.0};
     int strike_offset{};
     bool simulated_pricing{};
     double allocation{10000.0};
@@ -156,7 +159,7 @@ struct MomentumStudyPreset {
     int strike_minimum{-1};
     int strike_maximum{1};
     std::map<int,std::pair<double,double>> pricing;
-    QString result_cache_key;
+    QString saved_result_key;
 };
 
 std::vector<MomentumStudyPreset> load_study_presets() {
@@ -176,6 +179,8 @@ std::vector<MomentumStudyPreset> load_study_presets() {
             value.drop_rate=settings.value("drop_rate",0.0).toDouble();
             value.strike_enabled=settings.value("strike_enabled",false).toBool();
             value.strike_width=settings.value("strike_width",5.0).toDouble();
+            value.strike_resolution=settings.value(
+                "strike_resolution",value.strike_width).toDouble();
             value.strike_offset=settings.value("strike_offset",0).toInt();
             value.simulated_pricing=settings.value("simulated_pricing",false).toBool();
             value.allocation=settings.value("allocation",10000.0).toDouble();
@@ -190,7 +195,8 @@ std::vector<MomentumStudyPreset> load_study_presets() {
             value.skip_maximum=settings.value("skip_maximum",30).toInt();
             value.strike_minimum=settings.value("strike_minimum",-1).toInt();
             value.strike_maximum=settings.value("strike_maximum",1).toInt();
-            value.result_cache_key=settings.value("result_cache_key").toString();
+            value.saved_result_key=settings.value("saved_result_key",
+                settings.value("result_cache_key")).toString();
             const auto pricing_count=settings.beginReadArray("pricing");
             for(int index=0;index<pricing_count;++index) {
                 settings.setArrayIndex(index);
@@ -214,7 +220,7 @@ void save_study_preset(const MomentumStudyPreset& value) {
     settings.beginGroup("saved_studies");
     settings.beginGroup(value.id);
     settings.remove("");
-    settings.setValue("schema_version",2);
+    settings.setValue("schema_version",4);
     settings.setValue("strategy","momentum");
     settings.setValue("name",value.name);
     settings.setValue("symbol",value.symbol);
@@ -224,6 +230,7 @@ void save_study_preset(const MomentumStudyPreset& value) {
     settings.setValue("drop_rate",value.drop_rate);
     settings.setValue("strike_enabled",value.strike_enabled);
     settings.setValue("strike_width",value.strike_width);
+    settings.setValue("strike_resolution",value.strike_resolution);
     settings.setValue("strike_offset",value.strike_offset);
     settings.setValue("simulated_pricing",value.simulated_pricing);
     settings.setValue("allocation",value.allocation);
@@ -238,7 +245,7 @@ void save_study_preset(const MomentumStudyPreset& value) {
     settings.setValue("skip_maximum",value.skip_maximum);
     settings.setValue("strike_minimum",value.strike_minimum);
     settings.setValue("strike_maximum",value.strike_maximum);
-    settings.setValue("result_cache_key",value.result_cache_key);
+    settings.setValue("saved_result_key",value.saved_result_key);
     settings.beginWriteArray("pricing",static_cast<int>(value.pricing.size()));
     int index=0;
     for(const auto& [offset,pricing]:value.pricing) {
@@ -256,56 +263,87 @@ void delete_study_preset(const QString& id) {
     settings.remove(id);
 }
 
-constexpr quint32 analysis_cache_magic=0x4d4f4d43;
-constexpr quint32 analysis_cache_version=4;
+constexpr quint32 saved_result_magic=0x4d4f4d43;
+constexpr quint32 legacy_saved_result_version=7;
+constexpr quint32 eager_curve_result_version=8;
+constexpr quint32 saved_result_version=9;
 
 void write_profit_curve(QDataStream& stream,
     const std::vector<options::analysis::MomentumResult::ProfitPoint>& curve) {
+    QByteArray encoded;
+    encoded.reserve(static_cast<qsizetype>(curve.size()*12));
+    QDataStream curve_stream(&encoded,QIODevice::WriteOnly);
+    curve_stream.setVersion(QDataStream::Qt_6_0);
     stream<<static_cast<quint64>(curve.size());
-    for(const auto& point:curve)
-        stream<<QString::fromStdString(point.date)<<point.cumulative_profit;
+    for(const auto& point:curve) {
+        const auto date=QDate::fromString(QString::fromStdString(point.date),Qt::ISODate);
+        curve_stream<<static_cast<qint32>(date.toJulianDay())<<point.cumulative_profit;
+    }
+    stream<<encoded;
 }
 
 bool read_profit_curve(QDataStream& stream,
-    std::vector<options::analysis::MomentumResult::ProfitPoint>& curve) {
+    std::vector<options::analysis::MomentumResult::ProfitPoint>& curve,bool retain=true) {
     quint64 count{};
-    stream>>count;
+    quint32 encoded_size{};
+    stream>>count>>encoded_size;
     if(count>10000000) return false;
+    if(encoded_size==std::numeric_limits<quint32>::max()) {
+        curve.clear();
+        return count==0 && stream.status()==QDataStream::Ok;
+    }
+    if(encoded_size!=count*12) return false;
+    if(!retain) {
+        curve.clear();
+        return stream.skipRawData(static_cast<int>(encoded_size))==static_cast<int>(encoded_size) &&
+            stream.status()==QDataStream::Ok;
+    }
+    QByteArray encoded(static_cast<qsizetype>(encoded_size),Qt::Uninitialized);
+    if(stream.readRawData(encoded.data(),static_cast<int>(encoded_size))!=
+       static_cast<int>(encoded_size)) return false;
+    QDataStream curve_stream(encoded);
+    curve_stream.setVersion(QDataStream::Qt_6_0);
     curve.clear();
     curve.reserve(static_cast<std::size_t>(count));
     for(quint64 index=0;index<count;++index) {
-        QString date;
+        qint32 julian_day{};
         double profit{};
-        stream>>date>>profit;
-        curve.push_back({date.toStdString(),profit});
+        curve_stream>>julian_day>>profit;
+        const auto date=QDate::fromJulianDay(julian_day);
+        if(!date.isValid()) return false;
+        curve.push_back({date.toString(Qt::ISODate).toStdString(),profit});
     }
-    return stream.status()==QDataStream::Ok;
+    return stream.status()==QDataStream::Ok && curve_stream.status()==QDataStream::Ok;
 }
 
-void write_momentum_result(QDataStream& stream,const options::analysis::MomentumResult& value) {
+void write_momentum_result(QDataStream& stream,const options::analysis::MomentumResult& value,
+                           bool include_details=true) {
     stream<<value.comparisons<<value.skipped_comparisons<<value.dropped_comparisons
           <<value.wins<<value.losses<<value.ties<<value.win_percentage<<value.total_profit
           <<value.profit_percentage<<value.allocation<<value.ending_balance<<value.required_capital;
-    write_profit_curve(stream,value.profit_curve);
-    write_profit_curve(stream,value.high_profit_curve);
-    write_profit_curve(stream,value.low_profit_curve);
-    write_profit_curve(stream,value.no_drop_profit_curve);
+    const std::vector<options::analysis::MomentumResult::ProfitPoint> empty_curve;
+    write_profit_curve(stream,include_details ? value.profit_curve : empty_curve);
+    write_profit_curve(stream,include_details ? value.high_profit_curve : empty_curve);
+    write_profit_curve(stream,include_details ? value.low_profit_curve : empty_curve);
+    write_profit_curve(stream,include_details ? value.no_drop_profit_curve : empty_curve);
     stream<<static_cast<quint64>(value.drop_scenario_count)
-          <<static_cast<quint64>(value.trades.size());
-    for(const auto& trade:value.trades)
-        stream<<QString::fromStdString(trade.start_date)<<QString::fromStdString(trade.end_date)
-              <<trade.start_price<<trade.end_price<<trade.comparison_price<<trade.profit
-              <<static_cast<quint64>(trade.phase)<<static_cast<qint32>(trade.result);
+          <<static_cast<quint64>(include_details ? value.trades.size() : 0);
+    if(include_details)
+        for(const auto& trade:value.trades)
+            stream<<QString::fromStdString(trade.start_date)<<QString::fromStdString(trade.end_date)
+                  <<trade.start_price<<trade.end_price<<trade.comparison_price<<trade.profit
+                  <<static_cast<quint64>(trade.phase)<<static_cast<qint32>(trade.result);
 }
 
-bool read_momentum_result(QDataStream& stream,options::analysis::MomentumResult& value) {
+bool read_momentum_result(
+    QDataStream& stream,options::analysis::MomentumResult& value,bool retain_details=true) {
     stream>>value.comparisons>>value.skipped_comparisons>>value.dropped_comparisons
           >>value.wins>>value.losses>>value.ties>>value.win_percentage>>value.total_profit
           >>value.profit_percentage>>value.allocation>>value.ending_balance>>value.required_capital;
-    if(!read_profit_curve(stream,value.profit_curve) ||
-       !read_profit_curve(stream,value.high_profit_curve) ||
-       !read_profit_curve(stream,value.low_profit_curve) ||
-       !read_profit_curve(stream,value.no_drop_profit_curve)) return false;
+    if(!read_profit_curve(stream,value.profit_curve,retain_details) ||
+       !read_profit_curve(stream,value.high_profit_curve,retain_details) ||
+       !read_profit_curve(stream,value.low_profit_curve,retain_details) ||
+       !read_profit_curve(stream,value.no_drop_profit_curve,retain_details)) return false;
     quint64 scenarios{};
     stream>>scenarios;
     value.drop_scenario_count=static_cast<std::size_t>(scenarios);
@@ -313,7 +351,7 @@ bool read_momentum_result(QDataStream& stream,options::analysis::MomentumResult&
     stream>>trade_count;
     if(trade_count>10000000) return false;
     value.trades.clear();
-    value.trades.reserve(static_cast<std::size_t>(trade_count));
+    if(retain_details) value.trades.reserve(static_cast<std::size_t>(trade_count));
     for(quint64 index=0;index<trade_count;++index) {
         options::analysis::MomentumResult::TradeRecord trade;
         QString start_date,end_date;
@@ -328,17 +366,68 @@ bool read_momentum_result(QDataStream& stream,options::analysis::MomentumResult&
         trade.end_date=end_date.toStdString();
         trade.phase=static_cast<std::size_t>(phase);
         trade.result=static_cast<options::analysis::MomentumResult::TradeResult>(result);
-        value.trades.push_back(std::move(trade));
+        if(retain_details) value.trades.push_back(std::move(trade));
     }
     return stream.status()==QDataStream::Ok;
+}
+
+void write_momentum_row(QDataStream& stream,const MomentumStudyRow& row) {
+    stream<<row.window_days<<row.skip_days<<row.strike_offset;
+    write_momentum_result(stream,row.result,false);
+    stream<<row.strike_adjustment.has_value();
+    if(row.strike_adjustment)
+        stream<<row.strike_adjustment->width<<row.strike_adjustment->resolution
+              <<row.strike_adjustment->offset;
+    stream<<row.simulated_pricing.has_value();
+    if(row.simulated_pricing)
+        stream<<row.simulated_pricing->max_profit<<row.simulated_pricing->max_loss
+              <<row.simulated_pricing->allocation<<row.simulated_pricing->buy_slippage_per_share
+              <<row.simulated_pricing->sell_slippage_per_share
+              <<static_cast<qint32>(row.simulated_pricing->slippage_mode);
+    stream<<row.drop_rate;
+}
+
+bool read_momentum_row(QDataStream& stream,MomentumStudyRow& row,bool retain_details=false) {
+    stream>>row.window_days>>row.skip_days>>row.strike_offset;
+    if(!read_momentum_result(stream,row.result,retain_details)) return false;
+    bool has_adjustment{};
+    stream>>has_adjustment;
+    if(has_adjustment) {
+        row.strike_adjustment.emplace();
+        stream>>row.strike_adjustment->width>>row.strike_adjustment->resolution
+              >>row.strike_adjustment->offset;
+    }
+    bool has_pricing{};
+    stream>>has_pricing;
+    if(has_pricing) {
+        row.simulated_pricing.emplace();
+        qint32 slippage_mode{};
+        stream>>row.simulated_pricing->max_profit>>row.simulated_pricing->max_loss
+              >>row.simulated_pricing->allocation>>row.simulated_pricing->buy_slippage_per_share
+              >>row.simulated_pricing->sell_slippage_per_share>>slippage_mode;
+        if(slippage_mode<static_cast<qint32>(options::analysis::SlippageMode::none) ||
+           slippage_mode>static_cast<qint32>(options::analysis::SlippageMode::buy_and_sell))
+            return false;
+        row.simulated_pricing->slippage_mode=
+            static_cast<options::analysis::SlippageMode>(slippage_mode);
+    }
+    stream>>row.drop_rate;
+    return stream.status()==QDataStream::Ok;
+}
+
+int responsive_worker_count() {
+    const auto available=std::max(1,QThread::idealThreadCount());
+    const auto reserved=available>=4 ? std::max(2,available/4) : available>=2 ? 1 : 0;
+    return std::max(1,available-reserved);
 }
 
 QByteArray momentum_preset_bytes(const MomentumStudyPreset& value) {
     QByteArray bytes;
     QDataStream stream(&bytes,QIODevice::WriteOnly);
     stream.setVersion(QDataStream::Qt_6_0);
-    stream<<analysis_cache_version<<value.symbol<<value.parametric<<value.window_days
+    stream<<saved_result_version<<value.symbol<<value.parametric<<value.window_days
           <<value.skip_days<<value.drop_rate<<value.strike_enabled<<value.strike_width
+          <<value.strike_resolution
           <<value.strike_offset<<value.simulated_pricing<<value.allocation<<value.slippage_mode
           <<value.buy_slippage<<value.sell_slippage<<value.analysis_start<<value.analysis_end
           <<value.window_minimum<<value.window_maximum<<value.skip_minimum<<value.skip_maximum
@@ -353,119 +442,180 @@ QString momentum_settings_signature(const MomentumStudyPreset& value) {
         momentum_preset_bytes(value),QCryptographicHash::Sha256).toHex());
 }
 
-QString momentum_cache_key(const MomentumStudyPreset& value,std::span<const options::data::Bar> bars) {
-    auto bytes=momentum_preset_bytes(value);
-    QDataStream stream(&bytes,QIODevice::Append);
-    stream.setVersion(QDataStream::Qt_6_0);
-    stream<<static_cast<quint64>(bars.size());
-    for(const auto& bar:bars)
-        stream<<QString::fromStdString(bar.symbol)<<QString::fromStdString(bar.timestamp)
-              <<bar.open<<bar.high<<bar.low<<bar.close<<static_cast<qint64>(bar.volume)
-              <<static_cast<qint64>(bar.trade_count)<<bar.vwap;
-    return QString::fromLatin1(
-        QCryptographicHash::hash(bytes,QCryptographicHash::Sha256).toHex());
-}
-
-QString analysis_cache_path(const QString& key) {
+QString saved_result_path(const QString& key) {
     const auto directory=QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation)+
-        "/analysis-cache";
+        "/saved-results";
     QDir().mkpath(directory);
     return directory+"/"+key+".bin";
 }
 
-void save_cached_analysis(const QString& key,const MomentumAnalysisOutput& output,
-                          std::span<const options::data::Bar> bars) {
-    QSaveFile file(analysis_cache_path(key));
-    if(!file.open(QIODevice::WriteOnly)) return;
+QString legacy_cache_path(const QString& key) {
+    return QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation)+
+        "/analysis-cache/"+key+".bin";
+}
+
+bool saved_result_exists(const QString& key) {
+    return !key.isEmpty() &&
+        (QFileInfo::exists(saved_result_path(key)) || QFileInfo::exists(legacy_cache_path(key)));
+}
+
+bool saved_result_uses_parallel_format(const QString& key) {
+    QFile file(saved_result_path(key));
+    if(!file.open(QIODevice::ReadOnly)) return false;
     QDataStream stream(&file);
     stream.setVersion(QDataStream::Qt_6_0);
-    stream<<analysis_cache_magic<<analysis_cache_version<<key<<output.symbol<<output.parametric
+    quint32 magic{},version{};
+    QString stored_key;
+    stream>>magic>>version>>stored_key;
+    return stream.status()==QDataStream::Ok && magic==saved_result_magic &&
+        version==saved_result_version && stored_key==key;
+}
+
+bool save_study_results(const QString& key,const MomentumAnalysisOutput& output,
+                        std::span<const options::data::Bar> bars,
+                        const std::shared_ptr<AnalysisProgress>& progress) {
+    if(progress) {
+        progress->completed.store(0,std::memory_order_relaxed);
+        progress->phase.store(2,std::memory_order_relaxed);
+    }
+    QSaveFile file(saved_result_path(key));
+    if(!file.open(QIODevice::WriteOnly)) return false;
+    QDataStream stream(&file);
+    stream.setVersion(QDataStream::Qt_6_0);
+    stream<<saved_result_magic<<saved_result_version<<key<<output.symbol<<output.parametric
           <<output.strike_enabled<<output.simulated_pricing<<output.window_days<<output.skip_days
           <<output.strike_offset<<static_cast<quint64>(output.study_rows.size());
-    for(const auto& row:output.study_rows) {
-        stream<<row.window_days<<row.skip_days<<row.strike_offset;
-        write_momentum_result(stream,row.result);
-        stream<<row.strike_adjustment.has_value();
-        if(row.strike_adjustment)
-            stream<<row.strike_adjustment->width<<row.strike_adjustment->offset;
-        stream<<row.simulated_pricing.has_value();
-        if(row.simulated_pricing)
-            stream<<row.simulated_pricing->max_profit<<row.simulated_pricing->max_loss
-                  <<row.simulated_pricing->allocation<<row.simulated_pricing->buy_slippage_per_share
-                  <<row.simulated_pricing->sell_slippage_per_share
-                  <<static_cast<qint32>(row.simulated_pricing->slippage_mode);
-        stream<<row.drop_rate;
+    std::vector<QByteArray> encoded_rows(output.study_rows.size());
+    std::atomic<std::size_t> next_row{};
+    std::atomic<bool> encode_failed{};
+    const auto worker_count=std::min(
+        static_cast<std::size_t>(responsive_worker_count()),output.study_rows.size());
+    {
+        std::vector<std::jthread> workers;
+        workers.reserve(worker_count);
+        for(std::size_t worker=0;worker<worker_count;++worker) {
+            workers.emplace_back([&] {
+                while(!encode_failed.load(std::memory_order_relaxed)) {
+                    const auto index=next_row.fetch_add(1,std::memory_order_relaxed);
+                    if(index>=output.study_rows.size()) break;
+                    try {
+                        QDataStream row_stream(&encoded_rows[index],QIODevice::WriteOnly);
+                        row_stream.setVersion(QDataStream::Qt_6_0);
+                        write_momentum_row(row_stream,output.study_rows[index]);
+                        if(row_stream.status()!=QDataStream::Ok) {
+                            encode_failed.store(true,std::memory_order_relaxed);
+                            break;
+                        }
+                        if(progress) progress->completed.fetch_add(1,std::memory_order_relaxed);
+                    } catch(...) {
+                        encode_failed.store(true,std::memory_order_relaxed);
+                        break;
+                    }
+                }
+            });
+        }
     }
+    if(encode_failed.load(std::memory_order_relaxed)) return false;
+    for(const auto& encoded:encoded_rows) stream<<encoded;
     stream<<output.single_result.has_value();
-    if(output.single_result) write_momentum_result(stream,*output.single_result);
+    if(output.single_result) {
+        write_momentum_result(stream,*output.single_result);
+        if(progress) progress->completed.store(
+            progress->total.load(std::memory_order_relaxed),std::memory_order_relaxed);
+    }
     stream<<static_cast<quint64>(bars.size());
     for(const auto& bar:bars)
         stream<<QString::fromStdString(bar.symbol)<<QString::fromStdString(bar.timestamp)
               <<bar.open<<bar.high<<bar.low<<bar.close<<static_cast<qint64>(bar.volume)
               <<static_cast<qint64>(bar.trade_count)<<bar.vwap;
-    if(stream.status()==QDataStream::Ok) file.commit();
+    if(stream.status()!=QDataStream::Ok) return false;
+    return file.commit();
 }
 
-struct CachedMomentumAnalysis {
+struct SavedMomentumAnalysis {
     MomentumAnalysisOutput output;
     std::vector<options::data::Bar> bars;
 };
 
-std::optional<CachedMomentumAnalysis> load_cached_analysis(const QString& key) {
-    QFile file(analysis_cache_path(key));
+std::optional<SavedMomentumAnalysis> load_study_results(
+    const QString& key,const std::shared_ptr<AnalysisProgress>& progress,int requested_workers) {
+    QFile file(saved_result_path(key));
+    if(!file.exists()) file.setFileName(legacy_cache_path(key));
     if(!file.open(QIODevice::ReadOnly)) return std::nullopt;
     QDataStream stream(&file);
     stream.setVersion(QDataStream::Qt_6_0);
     quint32 magic{},version{};
     QString stored_key;
-    CachedMomentumAnalysis cached;
+    SavedMomentumAnalysis saved;
     stream>>magic>>version>>stored_key;
-    if(magic!=analysis_cache_magic || version!=analysis_cache_version || stored_key!=key)
+    if(magic!=saved_result_magic ||
+       (version!=legacy_saved_result_version && version!=eager_curve_result_version &&
+        version!=saved_result_version) || stored_key!=key)
         return std::nullopt;
-    stream>>cached.output.symbol>>cached.output.parametric>>cached.output.strike_enabled
-          >>cached.output.simulated_pricing>>cached.output.window_days>>cached.output.skip_days
-          >>cached.output.strike_offset;
+    stream>>saved.output.symbol>>saved.output.parametric>>saved.output.strike_enabled
+          >>saved.output.simulated_pricing>>saved.output.window_days>>saved.output.skip_days
+          >>saved.output.strike_offset;
     quint64 row_count{};
     stream>>row_count;
     if(row_count>10000) return std::nullopt;
-    cached.output.study_rows.reserve(static_cast<std::size_t>(row_count));
-    for(quint64 index=0;index<row_count;++index) {
-        MomentumStudyRow row;
-        stream>>row.window_days>>row.skip_days>>row.strike_offset;
-        if(!read_momentum_result(stream,row.result)) return std::nullopt;
-        bool has_adjustment{};
-        stream>>has_adjustment;
-        if(has_adjustment) {
-            row.strike_adjustment.emplace();
-            stream>>row.strike_adjustment->width>>row.strike_adjustment->offset;
-        }
-        bool has_pricing{};
-        stream>>has_pricing;
-        if(has_pricing) {
-            row.simulated_pricing.emplace();
-            qint32 slippage_mode{};
-            stream>>row.simulated_pricing->max_profit>>row.simulated_pricing->max_loss
-                  >>row.simulated_pricing->allocation>>row.simulated_pricing->buy_slippage_per_share
-                  >>row.simulated_pricing->sell_slippage_per_share>>slippage_mode;
-            if(slippage_mode<static_cast<qint32>(options::analysis::SlippageMode::none) ||
-               slippage_mode>static_cast<qint32>(options::analysis::SlippageMode::buy_and_sell))
+    if(progress) {
+        progress->completed.store(0,std::memory_order_relaxed);
+        progress->total=static_cast<std::size_t>(row_count);
+        progress->phase.store(3,std::memory_order_relaxed);
+    }
+    saved.output.study_rows.resize(static_cast<std::size_t>(row_count));
+    if(version==legacy_saved_result_version) {
+        for(quint64 index=0;index<row_count;++index) {
+            if(!read_momentum_row(stream,saved.output.study_rows[static_cast<std::size_t>(index)]))
                 return std::nullopt;
-            row.simulated_pricing->slippage_mode=
-                static_cast<options::analysis::SlippageMode>(slippage_mode);
+            if(progress) progress->completed.fetch_add(1,std::memory_order_relaxed);
         }
-        stream>>row.drop_rate;
-        cached.output.study_rows.push_back(std::move(row));
+    } else {
+        std::vector<QByteArray> encoded_rows(static_cast<std::size_t>(row_count));
+        for(auto& encoded:encoded_rows) stream>>encoded;
+        if(stream.status()!=QDataStream::Ok) return std::nullopt;
+        std::atomic<std::size_t> next_row{};
+        std::atomic<bool> decode_failed{};
+        const auto worker_count=std::min(
+            static_cast<std::size_t>(std::max(1,requested_workers)),encoded_rows.size());
+        {
+            std::vector<std::jthread> workers;
+            workers.reserve(worker_count);
+            for(std::size_t worker=0;worker<worker_count;++worker) {
+                workers.emplace_back([&] {
+                    while(!decode_failed.load(std::memory_order_relaxed)) {
+                        const auto index=next_row.fetch_add(1,std::memory_order_relaxed);
+                        if(index>=encoded_rows.size()) break;
+                        try {
+                            QDataStream row_stream(encoded_rows[index]);
+                            row_stream.setVersion(QDataStream::Qt_6_0);
+                            if(!read_momentum_row(row_stream,saved.output.study_rows[index]) ||
+                               row_stream.status()!=QDataStream::Ok) {
+                                decode_failed.store(true,std::memory_order_relaxed);
+                                break;
+                            }
+                            encoded_rows[index]=QByteArray();
+                            if(progress) progress->completed.fetch_add(1,std::memory_order_relaxed);
+                        } catch(...) {
+                            decode_failed.store(true,std::memory_order_relaxed);
+                            break;
+                        }
+                    }
+                });
+            }
+        }
+        if(decode_failed.load(std::memory_order_relaxed)) return std::nullopt;
     }
     bool has_single{};
     stream>>has_single;
     if(has_single) {
-        cached.output.single_result.emplace();
-        if(!read_momentum_result(stream,*cached.output.single_result)) return std::nullopt;
+        saved.output.single_result.emplace();
+        if(!read_momentum_result(stream,*saved.output.single_result)) return std::nullopt;
     }
     quint64 bar_count{};
     stream>>bar_count;
     if(bar_count>10000000) return std::nullopt;
-    cached.bars.reserve(static_cast<std::size_t>(bar_count));
+    saved.bars.reserve(static_cast<std::size_t>(bar_count));
     for(quint64 index=0;index<bar_count;++index) {
         options::data::Bar bar;
         QString symbol,timestamp;
@@ -475,12 +625,12 @@ std::optional<CachedMomentumAnalysis> load_cached_analysis(const QString& key) {
         bar.timestamp=timestamp.toStdString();
         bar.volume=volume;
         bar.trade_count=trade_count;
-        cached.bars.push_back(std::move(bar));
+        saved.bars.push_back(std::move(bar));
     }
     if(stream.status()!=QDataStream::Ok) return std::nullopt;
-    cached.output.cache_key=key;
-    cached.output.from_cache=true;
-    return cached;
+    saved.output.saved_result_key=key;
+    saved.output.loaded_saved_result=true;
+    return saved;
 }
 
 class NumericTableWidgetItem final : public QTableWidgetItem {
@@ -945,6 +1095,122 @@ QString averaged_count(double value) {
         : QString::number(value,'f',2);
 }
 
+class MomentumStudyTableModel final : public QAbstractTableModel {
+public:
+    explicit MomentumStudyTableModel(QObject* parent=nullptr) : QAbstractTableModel(parent) {}
+
+    int rowCount(const QModelIndex& parent={}) const override {
+        return parent.isValid() ? 0 : static_cast<int>(order_.size());
+    }
+
+    int columnCount(const QModelIndex& parent={}) const override {
+        return parent.isValid() ? 0 : 12;
+    }
+
+    QVariant headerData(int section,Qt::Orientation orientation,int role) const override {
+        if(role!=Qt::DisplayRole) return {};
+        if(orientation==Qt::Vertical) return section+1;
+        static const QString headers[]{"DTE","Skip","Strike offset","Win Rate %","Avg wins",
+            "Avg losses","Avg comparisons","Avg dropped","Total profit","Profit %",
+            "Capital Needed","Order"};
+        return section>=0 && section<12 ? QVariant(headers[section]) : QVariant();
+    }
+
+    QVariant data(const QModelIndex& index,int role=Qt::DisplayRole) const override {
+        if(!index.isValid() || !rows_ || index.row()<0 ||
+           static_cast<std::size_t>(index.row())>=order_.size()) return {};
+        const auto source=order_[static_cast<std::size_t>(index.row())];
+        const auto& value=(*rows_)[source];
+        if(role==Qt::UserRole) return static_cast<qulonglong>(source);
+        if(role==Qt::BackgroundRole && source<highlighted_.size() && highlighted_[source])
+            return QBrush(QColor("#c8e6c9"));
+        if(role!=Qt::DisplayRole) return {};
+        switch(index.column()) {
+        case 0: return QString::number(value.window_days);
+        case 1: return QString::number(value.skip_days);
+        case 2: return strike_enabled_ ? QString::number(value.strike_offset) : QString("Off");
+        case 3: return QString::number(value.result.win_percentage,'f',2)+"%";
+        case 4: return averaged_count(value.result.wins);
+        case 5: return averaged_count(value.result.losses);
+        case 6: return averaged_count(value.result.comparisons);
+        case 7: return averaged_count(value.result.dropped_comparisons);
+        case 8: return "$"+QString::number(value.result.total_profit,'f',2);
+        case 9: return QString::number(value.result.profit_percentage,'f',2)+"%";
+        case 10: return "$"+QString::number(value.result.required_capital,'f',2);
+        case 11: return QString::number(source);
+        default: return {};
+        }
+    }
+
+    void set_rows(const std::vector<MomentumStudyRow>* rows,bool strike_enabled) {
+        beginResetModel();
+        rows_=rows;
+        strike_enabled_=strike_enabled;
+        order_.clear();
+        highlighted_.clear();
+        if(rows_) {
+            order_.resize(rows_->size());
+            std::iota(order_.begin(),order_.end(),0);
+            highlighted_.assign(rows_->size(),false);
+            auto ranked=order_;
+            std::ranges::sort(ranked,[this](auto left,auto right) {
+                const auto& left_result=(*rows_)[left].result;
+                const auto& right_result=(*rows_)[right].result;
+                if(left_result.comparisons!=right_result.comparisons)
+                    return left_result.comparisons>right_result.comparisons;
+                return left_result.win_percentage>right_result.win_percentage;
+            });
+            ranked.resize(std::min<std::size_t>(10,ranked.size()));
+            for(const auto source:ranked) highlighted_[source]=true;
+        }
+        endResetModel();
+    }
+
+    void sort_by(int column,std::optional<Qt::SortOrder> direction) {
+        if(!rows_) return;
+        beginResetModel();
+        std::iota(order_.begin(),order_.end(),0);
+        if(direction) {
+            std::ranges::stable_sort(order_,[this,column,direction](auto left,auto right) {
+                const auto left_value=numeric_value((*rows_)[left],column,left);
+                const auto right_value=numeric_value((*rows_)[right],column,right);
+                return *direction==Qt::AscendingOrder
+                    ? left_value<right_value : left_value>right_value;
+            });
+        }
+        endResetModel();
+    }
+
+    std::size_t source_index(int displayed_row) const {
+        return displayed_row>=0 && static_cast<std::size_t>(displayed_row)<order_.size()
+            ? order_[static_cast<std::size_t>(displayed_row)]
+            : std::numeric_limits<std::size_t>::max();
+    }
+
+private:
+    static double numeric_value(const MomentumStudyRow& value,int column,std::size_t source) {
+        switch(column) {
+        case 0: return value.window_days;
+        case 1: return value.skip_days;
+        case 2: return value.strike_offset;
+        case 3: return value.result.win_percentage;
+        case 4: return value.result.wins;
+        case 5: return value.result.losses;
+        case 6: return value.result.comparisons;
+        case 7: return value.result.dropped_comparisons;
+        case 8: return value.result.total_profit;
+        case 9: return value.result.profit_percentage;
+        case 10: return value.result.required_capital;
+        default: return static_cast<double>(source);
+        }
+    }
+
+    const std::vector<MomentumStudyRow>* rows_{};
+    std::vector<std::size_t> order_;
+    std::vector<bool> highlighted_;
+    bool strike_enabled_{};
+};
+
 QString initial_database_path() {
     QSettings settings("OptionsBacktester","OptionsBacktester");
     const auto saved=settings.value("database").toString();
@@ -1289,6 +1555,12 @@ private:
         strike_width->setValue(5.0);
         strike_width->setPrefix("$");
         strike_width->setEnabled(false);
+        auto* strike_resolution=new QDoubleSpinBox;
+        strike_resolution->setRange(0.01,10000.0);
+        strike_resolution->setDecimals(2);
+        strike_resolution->setValue(1.0);
+        strike_resolution->setPrefix("$");
+        strike_resolution->setEnabled(false);
         auto* strike_offset=new QSpinBox;
         strike_offset->setRange(-100,100);
         strike_offset->setValue(0);
@@ -1334,6 +1606,7 @@ private:
         controls->addRow("Drop rate",drop_rate);
         controls->addRow("Strike analysis",strike_enabled);
         controls->addRow("Strike width",strike_width);
+        controls->addRow("Resolution",strike_resolution);
         controls->addRow(strike_offset_label,strike_offset);
         controls->addRow("Pseudo-backtest",simulated_pricing);
         controls->addRow("Trading allocation",allocation);
@@ -1407,12 +1680,13 @@ private:
         results->addRow("Average dropped per start",dropped);
         layout->addWidget(single_results);
 
-        auto* study_table=new QTableWidget(0,12);
-        study_table->setHorizontalHeaderLabels(
-            {"DTE","Skip","Strike offset","Win Rate %","Avg wins","Avg losses",
-             "Avg comparisons","Avg dropped","Total profit","Profit %","Capital Needed","Order"});
+        std::vector<MomentumStudyRow> study_rows;
+        auto* study_table=new QTableView;
+        auto* study_model=new MomentumStudyTableModel(study_table);
+        study_table->setModel(study_model);
         study_table->horizontalHeader()->setMinimumSectionSize(80);
-        study_table->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+        study_table->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
+        study_table->horizontalHeader()->setDefaultSectionSize(110);
         study_table->horizontalHeader()->setStretchLastSection(false);
         study_table->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
         study_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -1452,7 +1726,6 @@ private:
 
         int active_sort_column=-1;
         int sort_cycle=0;
-        std::vector<MomentumStudyRow> study_rows;
         std::vector<options::data::Bar> analyzed_bars;
         QString analyzed_symbol=symbol;
         std::shared_ptr<AnalysisProgress> active_analysis_progress;
@@ -1460,25 +1733,38 @@ private:
         progress_timer->setInterval(100);
         connect(progress_timer,&QTimer::timeout,&dialog,[&] {
             if(!active_analysis_progress) return;
-            if(!active_analysis_progress->calculating.load(std::memory_order_relaxed)) {
-                activity_label->setText("Checking saved results…");
+            const auto phase=active_analysis_progress->phase.load(std::memory_order_relaxed);
+            if(phase==0) {
+                activity_label->setText("Opening saved results…");
                 activity_bar->setRange(0,0);
                 return;
             }
             const auto completed=active_analysis_progress->completed.load(std::memory_order_relaxed);
-            const auto total=active_analysis_progress->total;
+            const auto total=active_analysis_progress->total.load(std::memory_order_relaxed);
             const auto remaining=total>completed ? total-completed : 0;
             activity_bar->setRange(0,static_cast<int>(total));
             activity_bar->setValue(static_cast<int>(completed));
-            activity_label->setText(remaining==0
-                ? QString::number(total)+" / "+QString::number(total)+
-                    " complete — saving results…"
-                : QString::number(completed)+" / "+QString::number(total)+
-                    " complete — "+QString::number(remaining)+" remaining");
+            if(phase==2) {
+                activity_label->setText(remaining==0
+                    ? "Finalizing saved results…"
+                    : "Saving results: "+QString::number(completed)+" / "+QString::number(total)+
+                        " rows — "+QString::number(remaining)+" remaining");
+            } else if(phase==3) {
+                activity_label->setText(remaining==0
+                    ? "Loaded "+QString::number(total)+" / "+QString::number(total)+" result rows"
+                    : "Loading results: "+QString::number(completed)+" / "+QString::number(total)+
+                        " rows — "+QString::number(remaining)+" remaining");
+            } else {
+                activity_label->setText(remaining==0
+                    ? QString::number(total)+" / "+QString::number(total)+
+                        " calculations complete"
+                    : QString::number(completed)+" / "+QString::number(total)+
+                        " complete — "+QString::number(remaining)+" remaining");
+            }
         });
         connect(study_table->horizontalHeader(),&QHeaderView::sectionClicked,&dialog,
             [=,&active_sort_column,&sort_cycle](int column) {
-                if(study_table->rowCount()==0) return;
+                if(study_model->rowCount()==0) return;
                 if(column!=active_sort_column) {
                     active_sort_column=column;
                     sort_cycle=1;
@@ -1486,7 +1772,7 @@ private:
                     sort_cycle=(sort_cycle+1)%3;
                 }
                 if(sort_cycle==0) {
-                    study_table->sortItems(11,Qt::AscendingOrder);
+                    study_model->sort_by(11,std::nullopt);
                     study_table->horizontalHeader()->setSortIndicatorShown(false);
                     active_sort_column=-1;
                     return;
@@ -1494,7 +1780,7 @@ private:
                 const auto order=sort_cycle==1 ? Qt::DescendingOrder : Qt::AscendingOrder;
                 study_table->horizontalHeader()->setSortIndicator(column,order);
                 study_table->horizontalHeader()->setSortIndicatorShown(true);
-                study_table->sortItems(column,order);
+                study_model->sort_by(column,order);
             });
 
         auto* ledger_watcher=new QFutureWatcher<MomentumLedgerOutput>(&dialog);
@@ -1517,12 +1803,10 @@ private:
                 " executed-trade ledger rows for the selected median scenario.");
             show_profit_chart(&dialog,output.title,output.result,output.bars);
         });
-        connect(study_table,&QTableWidget::cellDoubleClicked,&dialog,
-            [&](int row,int) {
+        connect(study_table,&QTableView::doubleClicked,&dialog,
+            [&](const QModelIndex& model_index) {
                 if(ledger_watcher->isRunning()) return;
-                const auto* item=study_table->item(row,0);
-                if(!item) return;
-                const auto index=item->data(Qt::UserRole).toULongLong();
+                const auto index=study_model->source_index(model_index.row());
                 if(index>=study_rows.size()) return;
                 const auto& value=study_rows[static_cast<std::size_t>(index)];
                 if(!value.simulated_pricing) return;
@@ -1614,6 +1898,7 @@ private:
         });
         connect(strike_enabled,&QCheckBox::toggled,&dialog,[=](bool enabled) {
             strike_width->setEnabled(enabled);
+            strike_resolution->setEnabled(enabled);
             strike_offset->setEnabled(enabled && !parametric->isChecked());
             strike_range_row->setVisible(enabled && parametric->isChecked());
             simulated_pricing->setEnabled(enabled);
@@ -1670,13 +1955,15 @@ private:
         QString loaded_study_id=preset ? preset->id : QString();
         QString loaded_study_name=preset ? preset->name : QString();
         QString loaded_study_symbol=preset ? preset->symbol : QString();
-        QString last_result_cache_key;
+        QString last_saved_result_key;
         QString last_result_settings_signature;
+        std::optional<MomentumAnalysisOutput> last_analysis_result;
         if(preset) {
             window_days->setValue(preset->window_days);
             skip_days->setValue(preset->skip_days);
             drop_rate->setValue(preset->drop_rate);
             strike_width->setValue(preset->strike_width);
+            strike_resolution->setValue(preset->strike_resolution);
             strike_offset->setValue(preset->strike_offset);
             allocation->setValue(preset->allocation);
             slippage_mode->setCurrentIndex(qBound(0,preset->slippage_mode,3));
@@ -1716,6 +2003,7 @@ private:
             value.drop_rate=drop_rate->value();
             value.strike_enabled=strike_enabled->isChecked();
             value.strike_width=strike_width->value();
+            value.strike_resolution=strike_resolution->value();
             value.strike_offset=strike_offset->value();
             value.simulated_pricing=simulated_pricing->isChecked();
             value.allocation=allocation->value();
@@ -1760,15 +2048,80 @@ private:
             if(id.isEmpty()) id=QUuid::createUuid().toString(QUuid::WithoutBraces);
 
             auto value=capture_preset(proposed,id);
-            if(momentum_settings_signature(value)==last_result_settings_signature)
-                value.result_cache_key=last_result_cache_key;
+            const auto has_matching_result=last_analysis_result &&
+                momentum_settings_signature(value)==last_result_settings_signature &&
+                !last_saved_result_key.isEmpty();
+            value.saved_result_key.clear();
+            if(has_matching_result && saved_result_exists(last_saved_result_key))
+                value.saved_result_key=last_saved_result_key;
             save_study_preset(value);
             loaded_study_id=id;
             loaded_study_name=proposed;
             loaded_study_symbol=selected_symbol;
             dialog.setWindowTitle("Momentum Analysis — "+value.symbol+" — "+proposed);
-            analysis_status->setText("Saved study \""+proposed+"\".");
             refresh_saved_studies(id);
+            if(!has_matching_result) {
+                analysis_status->setText(
+                    "Saved study \""+proposed+"\" without results because its current settings have not been run.");
+                return;
+            }
+            if(!value.saved_result_key.isEmpty() &&
+               saved_result_uses_parallel_format(value.saved_result_key)) {
+                analysis_status->setText("Saved study \""+proposed+"\" with its existing results.");
+                return;
+            }
+
+            auto saved_output=std::make_shared<MomentumAnalysisOutput>(*last_analysis_result);
+            if(saved_output->parametric) saved_output->study_rows=study_rows;
+            active_analysis_progress=std::make_shared<AnalysisProgress>();
+            active_analysis_progress->total=saved_output->parametric
+                ? saved_output->study_rows.size() : 1;
+            active_analysis_progress->phase.store(2,std::memory_order_relaxed);
+            const auto save_progress=active_analysis_progress;
+            const auto result_key=last_saved_result_key;
+            const auto saved_bars=analyzed_bars;
+            controls_widget->setEnabled(false);
+            parameter_ranges->setEnabled(false);
+            pricing_editor->setEnabled(false);
+            study_table->setEnabled(false);
+            save_button->setEnabled(false);
+            analyze_button->setEnabled(false);
+            analysis_activity->setVisible(true);
+            analysis_status->setText("Saving study \""+proposed+"\" and its analysis results…");
+            progress_timer->start();
+
+            auto* save_watcher=new QFutureWatcher<bool>(&dialog);
+            connect(save_watcher,&QFutureWatcher<bool>::finished,&dialog,
+                [&,save_watcher,saved_output,value,result_key]() mutable {
+                    const auto saved=save_watcher->result();
+                    progress_timer->stop();
+                    active_analysis_progress.reset();
+                    controls_widget->setEnabled(true);
+                    parameter_ranges->setEnabled(true);
+                    pricing_editor->setEnabled(true);
+                    study_table->setEnabled(true);
+                    save_button->setEnabled(true);
+                    analyze_button->setEnabled(true);
+                    analysis_activity->setVisible(false);
+                    activity_label->setText("Analyzing…");
+                    activity_bar->setRange(0,0);
+                    if(saved) {
+                        auto saved_value=value;
+                        saved_value.saved_result_key=result_key;
+                        save_study_preset(saved_value);
+                        refresh_saved_studies(saved_value.id);
+                        analysis_status->setText(
+                            "Saved study \""+saved_value.name+"\" with its analysis results.");
+                    } else {
+                        analysis_status->setText(
+                            "Saved the study parameters, but its analysis results could not be written.");
+                    }
+                    save_watcher->deleteLater();
+                });
+            save_watcher->setFuture(QtConcurrent::run(
+                [result_key,saved_output,saved_bars,save_progress] {
+                    return save_study_results(result_key,*saved_output,saved_bars,save_progress);
+                }));
         });
 
         auto* analysis_watcher=new QFutureWatcher<MomentumAnalysisOutput>(&dialog);
@@ -1791,20 +2144,24 @@ private:
         };
         connect(analysis_watcher,&QFutureWatcher<MomentumAnalysisOutput>::finished,&dialog,
             [&,set_busy,analysis_watcher] {
-                set_busy(false);
-                auto output=analysis_watcher->result();
+                auto output=analysis_watcher->future().takeResult();
                 if(!output.error.isEmpty()) {
+                    set_busy(false);
                     analysis_status->setText("Analysis failed: "+output.error);
                     return;
                 }
-                if(output.cache_miss) {
+                if(output.saved_result_missing) {
+                    set_busy(false);
                     analysis_status->setText(
-                        "No valid cached result is available for this saved study. Select Run to analyze it.");
+                        "No saved result is available for this study. Select Run to analyze it.");
                     return;
                 }
-                last_result_cache_key=output.cache_key;
+                last_saved_result_key=output.saved_result_key;
                 last_result_settings_signature=output.settings_signature;
                 if(output.parametric) {
+                    progress_timer->stop();
+                    activity_label->setText("Preparing result table…");
+                    activity_bar->setRange(0,0);
                     study_rows=std::move(output.study_rows);
                     active_sort_column=-1;
                     sort_cycle=0;
@@ -1813,52 +2170,19 @@ private:
                     study_table->setColumnHidden(9,!output.simulated_pricing);
                     study_table->setColumnHidden(10,!output.simulated_pricing);
                     study_table->setColumnHidden(11,true);
-                    study_table->setUpdatesEnabled(false);
-                    study_table->setRowCount(static_cast<int>(study_rows.size()));
-                    std::vector<std::size_t> comparison_rank(study_rows.size());
-                    std::iota(comparison_rank.begin(),comparison_rank.end(),0);
-                    std::ranges::sort(comparison_rank,[&study_rows](auto left,auto right) {
-                        if(study_rows[left].result.comparisons!=study_rows[right].result.comparisons)
-                            return study_rows[left].result.comparisons>study_rows[right].result.comparisons;
-                        return study_rows[left].result.win_percentage>study_rows[right].result.win_percentage;
-                    });
-                    comparison_rank.resize(qMin<std::size_t>(10,comparison_rank.size()));
-                    for(int row=0;row<static_cast<int>(study_rows.size());++row) {
-                        const auto& value=study_rows[static_cast<std::size_t>(row)];
-                        const QString cells[]{QString::number(value.window_days),
-                            QString::number(value.skip_days),output.strike_enabled
-                                ? QString::number(value.strike_offset) : "Off",
-                            QString::number(value.result.win_percentage,'f',2)+"%",
-                            averaged_count(value.result.wins),averaged_count(value.result.losses),
-                            averaged_count(value.result.comparisons),averaged_count(value.result.dropped_comparisons),
-                            "$"+QString::number(value.result.total_profit,'f',2),
-                            QString::number(value.result.profit_percentage,'f',2)+"%",
-                            "$"+QString::number(value.result.required_capital,'f',2),QString::number(row)};
-                        const double numeric_values[]{static_cast<double>(value.window_days),
-                            static_cast<double>(value.skip_days),
-                            static_cast<double>(value.strike_offset),value.result.win_percentage,
-                            value.result.wins,value.result.losses,value.result.comparisons,
-                            value.result.dropped_comparisons,value.result.total_profit,value.result.profit_percentage,
-                            value.result.required_capital,static_cast<double>(row)};
-                        const auto highlight=std::ranges::find(
-                            comparison_rank,static_cast<std::size_t>(row))!=comparison_rank.end();
-                        for(int column=0;column<12;++column) {
-                            auto* item=new NumericTableWidgetItem(cells[column],numeric_values[column]);
-                            item->setData(Qt::UserRole,static_cast<qulonglong>(row));
-                            if(highlight) item->setBackground(QBrush(QColor("#c8e6c9")));
-                            study_table->setItem(row,column,item);
-                        }
-                    }
-                    study_table->setUpdatesEnabled(true);
+                    study_model->set_rows(&study_rows,output.strike_enabled);
                     analysis_status->setText(
-                        (output.from_cache ? "Loaded cached results for " : "Generated ")+
+                        (output.loaded_saved_result ? "Loaded saved results for " : "Generated ")+
                         QString::number(study_rows.size())+
                         " parameter combinations. Click a header to sort"+
                         (output.simulated_pricing
                             ? "; double-click a row to view its cumulative profit chart." : "."));
+                    last_analysis_result=std::move(output);
+                    set_busy(false);
                     return;
                 }
                 if(!output.single_result) {
+                    set_busy(false);
                     analysis_status->setText("Analysis failed to return a result.");
                     return;
                 }
@@ -1871,14 +2195,18 @@ private:
                 dropped->setText(averaged_count(result.dropped_comparisons));
                 analysis_status->setText(result.comparisons==0
                     ? "The selected analysis range is too short for this comparison window."
-                    : output.from_cache ? "Loaded cached analysis result." : QString());
-                if(output.open_profit_chart && output.simulated_pricing && result.comparisons!=0)
+                    : output.loaded_saved_result ? "Loaded saved analysis result." : QString());
+                const auto open_chart=
+                    output.open_profit_chart && output.simulated_pricing && result.comparisons!=0;
+                set_busy(false);
+                if(open_chart)
                     show_profit_chart(&dialog,output.symbol+"  x="+QString::number(output.window_days)+
                         " d="+QString::number(output.skip_days)+
                         " strike="+QString::number(output.strike_offset),result,analyzed_bars);
+                last_analysis_result=std::move(output);
             });
 
-        const auto analyze=[&,set_busy,analysis_watcher](bool cache_only) {
+        const auto analyze=[&,set_busy,analysis_watcher](bool load_saved) {
             if(analysis_watcher->isRunning()) return;
             if(analysis_start->date()>analysis_end->date()) {
                 analysis_status->setText("The analysis start must not be after the end.");
@@ -1892,12 +2220,14 @@ private:
                     analysis_end->date().toString(Qt::ISODate).toStdString()});
                 const auto current_preset=capture_preset({},{});
                 const auto settings_signature=momentum_settings_signature(current_preset);
-                const auto cache_key=momentum_cache_key(current_preset,analyzed_bars);
+                const auto result_key=load_saved && preset
+                    ? preset->saved_result_key
+                    : QUuid::createUuid().toString(QUuid::WithoutBraces);
                 MomentumAnalysisOutput output;
                 output.symbol=run_symbol;
-                output.cache_key=cache_key;
+                output.saved_result_key=result_key;
                 output.settings_signature=settings_signature;
-                output.open_profit_chart=!cache_only;
+                output.open_profit_chart=!load_saved;
                 output.parametric=parametric->isChecked();
                 output.strike_enabled=strike_enabled->isChecked();
                 output.simulated_pricing=simulated_pricing->isChecked();
@@ -1932,7 +2262,7 @@ private:
                                 MomentumStudyRequest request{x,d,offset};
                                 if(output.strike_enabled)
                                     request.strike_adjustment=options::analysis::StrikeAdjustment{
-                                        strike_width->value(),offset};
+                                        strike_width->value(),strike_resolution->value(),offset};
                                 if(output.simulated_pricing)
                                     request.simulated_pricing=pricing_editor->pricing_for(offset);
                                 if(output.simulated_pricing && !request.simulated_pricing) {
@@ -1949,7 +2279,7 @@ private:
                         output.window_days,output.skip_days,output.strike_offset};
                     if(output.strike_enabled)
                         request.strike_adjustment=options::analysis::StrikeAdjustment{
-                            strike_width->value(),output.strike_offset};
+                            strike_width->value(),strike_resolution->value(),output.strike_offset};
                     if(output.simulated_pricing)
                         request.simulated_pricing=pricing_editor->pricing_for(output.strike_offset);
                     if(output.simulated_pricing && !request.simulated_pricing) {
@@ -1970,30 +2300,44 @@ private:
                 const auto rate=drop_rate->value();
                 active_analysis_progress=std::make_shared<AnalysisProgress>();
                 active_analysis_progress->total=request_count;
+                active_analysis_progress->phase.store(load_saved ? 0 : 1,std::memory_order_relaxed);
                 const auto progress=active_analysis_progress;
                 const auto available_cores=std::max(1,QThread::idealThreadCount());
-                analysis_status->setText(cache_only ? "Loading saved analysis results…" :
+                const auto reserved_cores=available_cores>=4
+                    ? std::max(2,available_cores/4) : available_cores>=2 ? 1 : 0;
+                const auto analysis_workers=std::max(1,available_cores-reserved_cores);
+                analysis_status->setText(load_saved
+                    ? "Loading saved analysis results with up to "+
+                        QString::number(analysis_workers)+" workers…" :
                     output.parametric
-                        ? "Checking the cache, then analyzing "+QString::number(request_count)+
-                            " parameter combinations on up to "+QString::number(available_cores)+
-                            " CPU cores if needed…"
-                        : "Checking the cache, then running the analysis if needed…");
+                        ? "Analyzing "+QString::number(request_count)+
+                            " parameter combinations with up to "+QString::number(analysis_workers)+
+                            " workers ("+QString::number(reserved_cores)+
+                            " CPU cores reserved for responsiveness)…"
+                        : "Running the analysis…");
                 set_busy(true);
+                std::vector<MomentumStudyRow> previous_rows;
+                if(!load_saved) {
+                    study_model->set_rows(nullptr,false);
+                    previous_rows=std::move(study_rows);
+                }
                 analysis_watcher->setFuture(QtConcurrent::run(
-                    [bars=analyzed_bars,requests=std::move(requests),rate,cache_only,
-                     output=std::move(output),progress]() mutable {
-                        if(auto cached=load_cached_analysis(output.cache_key)) {
-                            cached->output.cache_key=output.cache_key;
-                            cached->output.settings_signature=output.settings_signature;
-                            cached->output.from_cache=true;
-                            cached->output.open_profit_chart=output.open_profit_chart;
-                            return std::move(cached->output);
-                        }
-                        if(cache_only) {
-                            output.cache_miss=true;
+                    [bars=analyzed_bars,requests=std::move(requests),rate,load_saved,
+                     output=std::move(output),progress,analysis_workers,
+                     previous_rows=std::move(previous_rows)]() mutable {
+                        std::vector<MomentumStudyRow>().swap(previous_rows);
+                        if(load_saved) {
+                            if(auto saved=load_study_results(
+                                output.saved_result_key,progress,analysis_workers)) {
+                                saved->output.saved_result_key=output.saved_result_key;
+                                saved->output.settings_signature=output.settings_signature;
+                                saved->output.loaded_saved_result=true;
+                                saved->output.open_profit_chart=output.open_profit_chart;
+                                return std::move(saved->output);
+                            }
+                            output.saved_result_missing=true;
                             return output;
                         }
-                        progress->calculating.store(true,std::memory_order_relaxed);
                         try {
                             if(output.parametric) {
                                 std::vector<MomentumStudyRow> rows(requests.size());
@@ -2001,9 +2345,8 @@ private:
                                 std::atomic<bool> failed{};
                                 std::mutex error_mutex;
                                 std::string worker_error;
-                                const auto core_count=static_cast<std::size_t>(
-                                    std::max(1,QThread::idealThreadCount()));
-                                const auto worker_count=std::min(core_count,requests.size());
+                                const auto worker_count=std::min(
+                                    static_cast<std::size_t>(analysis_workers),requests.size());
                                 {
                                     std::vector<std::jthread> workers;
                                     workers.reserve(worker_count);
@@ -2020,7 +2363,8 @@ private:
                                                         options::analysis::analyze_momentum_drop_scenarios(
                                                             bars,static_cast<std::size_t>(request.window_days),
                                                             static_cast<std::size_t>(request.skip_days),
-                                                            request.strike_adjustment,request.simulated_pricing,rate),
+                                                            request.strike_adjustment,request.simulated_pricing,
+                                                            rate,5,false,false),
                                                         request.strike_adjustment,request.simulated_pricing,rate};
                                                     progress->completed.fetch_add(1,std::memory_order_relaxed);
                                                 } catch(const std::exception& error) {
@@ -2053,7 +2397,6 @@ private:
                         } catch(const std::exception& error) {
                             output.error=QString::fromUtf8(error.what());
                         }
-                        if(output.error.isEmpty()) save_cached_analysis(output.cache_key,output,bars);
                         return output;
                     }));
             } catch(const std::exception& error) {

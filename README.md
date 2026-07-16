@@ -209,15 +209,14 @@ field-based format, so parameters introduced by
 future releases can use their defaults when an older study is loaded and can then
 be adjusted before running or saving again.
 
-Completed analyses are cached persistently with their full single result or
-parametric table, statistics, profit curves, and underlying daily bars. Saving a
-study associates its unchanged parameter snapshot with that cached result, so a
-valid saved study restores its results immediately when loaded and does not open a
-profit-chart popup until requested by running or selecting a table row. Selecting
-Run with unchanged inputs also reuses the cache. Cache keys include every strategy
-parameter, simulated-pricing value, ticker, date range, and the complete market-data
-snapshot; changing any of them automatically requires a fresh analysis. Identical
-templates may share a cached result even when saved under different names.
+Selecting **Save Study…** stores the study parameters and, when those exact
+settings have just been run, the completed single result or parametric table,
+summary statistics, and underlying daily bars. Single-result studies retain their
+chart data, while parametric studies save summaries only. A saved study restores that
+result when explicitly loaded and does not open a profit-chart popup until a table
+row is selected. Pressing **Run Analysis** always performs a fresh calculation;
+there is no automatic result-cache lookup or reuse. If the displayed parameters
+have not been run, only the study template is saved.
 
 Momentum uses each daily bar's VWAP as the analysis price, falling back to close
 only when VWAP is unavailable. **Drop rate** is a fixed, non-parametric percentage
@@ -238,15 +237,19 @@ start phase rather than inflating the figures by aggregating all phases. This
 reduces the effect of an unusually lucky or unlucky initial entry date.
 
 Enable **Compare against an option strike** to replace q's stock close with a
-synthetic option-strike threshold. Strikes are multiples of the configured dollar
-width anchored at zero, so a $2.50 width produces $10.00, $12.50, $15.00, and so
-on. Offset -1 selects the first strike strictly below q, +1 the first strictly
-above q, and 0 the nearest strike; larger magnitudes move farther along the grid.
-That selected strike represents the lower spread leg. The comparison threshold is
-the second leg one configured strike width higher, so it is calculated as
-`selected strike + strike width`. The ledger and hover shading use this same upper
-spread boundary. In parametric mode the strike-offset range is studied alongside x
-and d, while the strike width remains fixed at the programmed value.
+synthetic option-spread threshold. **Resolution** is the spacing between offered
+lower-leg strikes, while **Strike Width** is the distance between the lower and
+upper legs of each spread. Both are fixed, non-parametric settings. With $1
+resolution and $5 width, the available spreads include 490/495, 491/496, and
+492/497. Offset -1 selects one resolution step below the current-price boundary,
++1 selects one step above it, and larger magnitudes move farther along the
+resolution grid; offset 0 uses the nearest grid price. The selected grid price is
+the lower spread leg, and the comparison threshold is `lower leg + strike width`.
+For example, price $756.56 with $1 resolution, $5 width, and offset -2 produces
+755/760 and a $760 comparison price. Price $451.32 with $2.50 resolution, $5
+width, and offset +2 produces 455/460 and a $460 comparison price. The ledger and
+hover shading use this same upper spread boundary. In parametric mode only the
+strike-offset range is swept alongside x and d.
 
 Enable **Use simulated spread pricing** to provide one-contract maximum-profit and
 maximum-loss values for every studied strike offset. When negative and positive
@@ -260,7 +263,9 @@ phases in the same way as the momentum statistics. Parametric table headers use
 **DTE**, **Skip**, and **Win Rate %**, omit the average-ties and Rank columns, and
 use the table's built-in row numbers for the current rank.
 
-Trade ledgers are generated on demand rather than during the parametric sweep.
+Profit curves and trade ledgers are generated on demand rather than during the
+parametric sweep. Summary rows calculate total profit directly without constructing
+or retaining per-date curve points.
 Double-clicking a simulated-pricing result row reconstructs only that row's
 deterministic median drop scenario on the background worker, then opens its
 four-line profit chart with an executed-trades table underneath. The ledger lists
@@ -310,14 +315,32 @@ is active; their inclusive range controls take their place.
 
 Momentum calculations run on a background worker so long parametric studies do
 not block the desktop interface or cause operating-system “not responding”
-warnings. After the cache check, independent parameter combinations are distributed
-through a thread-safe work queue across as many workers as Qt reports available
-CPU cores. Results are written back in their original deterministic order. While
-a study is running, the progress bar reports completed, total, and remaining
-parameter combinations; once calculation finishes it indicates that cache results
-are being saved. Parameter, save, and run controls are temporarily locked so the
-displayed results always correspond to the exact settings captured at the start
-of the run.
+warnings. Independent parameter combinations are distributed through a thread-safe
+work queue. On systems with four or more reported logical
+cores, roughly one quarter (and at least two) are reserved for the Qt interface,
+operating system, and memory-bandwidth headroom; smaller systems reserve one core
+when possible. The remaining cores run analysis workers, avoiding
+the event-loop starvation that can otherwise trigger false “not responding”
+warnings under sustained load. Results are written back in their original
+deterministic order. While a study is running, the progress bar reports completed,
+total, and remaining parameter combinations, and calculation completion returns
+directly to the results table without writing a result file. On reruns, the prior
+result is released on the analysis worker before new result storage is allocated.
+The completed result is moved, rather than copied, back to the interface, and table
+display uses a lazy model backed directly by those rows. Only visible cell text is
+formatted; loading no longer creates one widget item per table cell, and sorting
+reorders lightweight row indices rather than table objects.
+Selecting **Save
+Study…** writes the result attached to that study on a background worker with
+saved-row and remaining-row progress. Each summary strategy row is stored as an
+independent block so
+saved parametric results can be decoded concurrently using the same reserved-core
+policy as calculation. Older result files remain readable; their obsolete embedded
+curves are skipped during loading and removed the next time the study is saved.
+Result-write failures are
+reported without discarding the completed analysis or saved parameters. Parameter,
+save, and run controls are temporarily locked during their respective background
+operations so displayed results always correspond to the captured settings.
 
 The Momentum dialog opens at a screen-aware size, can be maximized or expanded
 without an application-imposed maximum width, and automatically grows when

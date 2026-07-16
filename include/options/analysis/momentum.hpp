@@ -53,6 +53,7 @@ struct MomentumResult {
 
 struct StrikeAdjustment {
     double width{};
+    double resolution{};
     int offset{};
 };
 
@@ -77,13 +78,13 @@ struct SimulatedPricing {
     std::optional<StrikeAdjustment> strike_adjustment=std::nullopt,
     std::optional<SimulatedPricing> simulated_pricing=std::nullopt,
     double drop_rate_percent=0.0, std::uint64_t drop_seed=0,
-    bool collect_trades=false);
+    bool collect_trades=false, bool collect_profit_curves=true);
 
 [[nodiscard]] MomentumResult analyze_momentum_drop_scenarios(
     std::span<const data::Bar> bars, std::size_t window_days, std::size_t skip_days,
     std::optional<StrikeAdjustment> strike_adjustment,
     std::optional<SimulatedPricing> simulated_pricing,
     double drop_rate_percent, std::size_t scenario_count=5,
-    bool collect_trades=false);
+    bool collect_trades=false, bool collect_profit_curves=true);
 
 }  // namespace options::analysis

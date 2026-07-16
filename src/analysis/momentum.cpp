@@ -31,14 +31,14 @@ struct ScheduledTrade {
 
 double comparison_price(double underlying,const std::optional<StrikeAdjustment>& adjustment) {
     if(!adjustment) return underlying;
-    const auto units=underlying/adjustment->width;
+    const auto units=underlying/adjustment->resolution;
     double selected_strike{};
     if(adjustment->offset<0)
-        selected_strike=(std::ceil(units)+static_cast<double>(adjustment->offset))*adjustment->width;
+        selected_strike=(std::ceil(units)+static_cast<double>(adjustment->offset))*adjustment->resolution;
     else if(adjustment->offset>0)
-        selected_strike=(std::floor(units)+static_cast<double>(adjustment->offset))*adjustment->width;
+        selected_strike=(std::floor(units)+static_cast<double>(adjustment->offset))*adjustment->resolution;
     else
-        selected_strike=std::round(units)*adjustment->width;
+        selected_strike=std::round(units)*adjustment->resolution;
     return selected_strike+adjustment->width;
 }
 
@@ -72,13 +72,16 @@ MomentumResult analyze_momentum(
     std::span<const data::Bar> bars, std::size_t window_days, std::size_t skip_days,
     std::optional<StrikeAdjustment> strike_adjustment,
     std::optional<SimulatedPricing> simulated_pricing,double drop_rate_percent,
-    std::uint64_t drop_seed,bool collect_trades) {
+    std::uint64_t drop_seed,bool collect_trades,bool collect_profit_curves) {
     if(window_days==0) throw std::invalid_argument("momentum window must be at least one day");
     if(skip_days==0) throw std::invalid_argument("momentum skip window must be at least one day");
     if(!std::isfinite(drop_rate_percent) || drop_rate_percent<0 || drop_rate_percent>100)
         throw std::invalid_argument("drop rate must be between 0 and 100 percent");
     if(strike_adjustment && (!std::isfinite(strike_adjustment->width) || strike_adjustment->width<=0))
         throw std::invalid_argument("strike width must be positive and finite");
+    if(strike_adjustment &&
+       (!std::isfinite(strike_adjustment->resolution) || strike_adjustment->resolution<=0))
+        throw std::invalid_argument("strike resolution must be positive and finite");
     if(simulated_pricing && (!std::isfinite(simulated_pricing->max_profit) ||
        !std::isfinite(simulated_pricing->max_loss) || simulated_pricing->max_profit<0 ||
        simulated_pricing->max_loss<=0 || !std::isfinite(simulated_pricing->allocation) ||
@@ -112,6 +115,7 @@ MomentumResult analyze_momentum(
 
     MomentumResult result;
     std::map<QDate,double> profit_changes;
+    double total_profit=0;
     const auto friction=simulated_pricing ? slippage_cost(*simulated_pricing) : 0.0;
     for(std::size_t phase=0;phase<skip_days;++phase) {
         std::vector<ScheduledTrade> scheduled;
@@ -186,7 +190,9 @@ MomentumResult analyze_momentum(
             const auto close_position=[&](const ScheduledTrade& trade) {
                 reserved_capital-=risk;
                 balance+=trade.profit;
-                profit_changes[observations[trade.exit].date]+=trade.profit;
+                total_profit+=trade.profit;
+                if(collect_profit_curves)
+                    profit_changes[observations[trade.exit].date]+=trade.profit;
             };
             for(const auto& trade:scheduled) {
                 while(!funded_open.empty() && funded_open.front()->exit<=trade.entry) {
@@ -227,14 +233,16 @@ MomentumResult analyze_momentum(
     result.ties/=phases;
     result.win_percentage/=phases;
     if(simulated_pricing) {
-        double cumulative=0;
-        result.profit_curve.push_back(
-            {observations.front().date.toString(Qt::ISODate).toStdString(),0});
-        for(const auto& [date,change]:profit_changes) {
-            cumulative+=change/phases;
-            result.profit_curve.push_back({date.toString(Qt::ISODate).toStdString(),cumulative});
+        result.total_profit=total_profit/phases;
+        if(collect_profit_curves) {
+            double cumulative=0;
+            result.profit_curve.push_back(
+                {observations.front().date.toString(Qt::ISODate).toStdString(),0});
+            for(const auto& [date,change]:profit_changes) {
+                cumulative+=change/phases;
+                result.profit_curve.push_back({date.toString(Qt::ISODate).toStdString(),cumulative});
+            }
         }
-        result.total_profit=cumulative;
         result.allocation=simulated_pricing->allocation;
         result.ending_balance=result.allocation+result.total_profit;
         result.profit_percentage=100.0*(result.ending_balance/result.allocation-1.0);
@@ -246,11 +254,13 @@ MomentumResult analyze_momentum_drop_scenarios(
     std::span<const data::Bar> bars, std::size_t window_days, std::size_t skip_days,
     std::optional<StrikeAdjustment> strike_adjustment,
     std::optional<SimulatedPricing> simulated_pricing,
-    double drop_rate_percent, std::size_t scenario_count,bool collect_trades) {
+    double drop_rate_percent, std::size_t scenario_count,bool collect_trades,
+    bool collect_profit_curves) {
     if(scenario_count<5) throw std::invalid_argument("drop analysis requires at least five scenarios");
     if(drop_rate_percent<=0)
         return analyze_momentum(
-            bars,window_days,skip_days,strike_adjustment,simulated_pricing,0,0,collect_trades);
+            bars,window_days,skip_days,strike_adjustment,simulated_pricing,0,0,
+            collect_trades,collect_profit_curves);
 
     std::vector<std::pair<std::uint64_t,MomentumResult>> scenarios;
     scenarios.reserve(scenario_count);
@@ -258,7 +268,7 @@ MomentumResult analyze_momentum_drop_scenarios(
         const auto seed=static_cast<std::uint64_t>(index+1);
         scenarios.emplace_back(seed,analyze_momentum(
             bars,window_days,skip_days,strike_adjustment,simulated_pricing,
-            drop_rate_percent,seed));
+            drop_rate_percent,seed,false,collect_profit_curves));
     }
     std::ranges::sort(scenarios,[simulated_pricing](const auto& left,const auto& right) {
         const auto left_score=simulated_pricing ? left.second.total_profit : left.second.win_percentage;
@@ -270,13 +280,15 @@ MomentumResult analyze_momentum_drop_scenarios(
     const auto median_index=scenario_count/2;
     auto result=collect_trades
         ? analyze_momentum(bars,window_days,skip_days,strike_adjustment,simulated_pricing,
-            drop_rate_percent,scenarios[median_index].first,true)
+            drop_rate_percent,scenarios[median_index].first,true,collect_profit_curves)
         : scenarios[median_index].second;
-    result.low_profit_curve=scenarios.front().second.profit_curve;
-    result.high_profit_curve=scenarios.back().second.profit_curve;
-    const auto no_drop=analyze_momentum(
-        bars,window_days,skip_days,strike_adjustment,simulated_pricing,0);
-    result.no_drop_profit_curve=no_drop.profit_curve;
+    if(collect_profit_curves) {
+        result.low_profit_curve=scenarios.front().second.profit_curve;
+        result.high_profit_curve=scenarios.back().second.profit_curve;
+        const auto no_drop=analyze_momentum(
+            bars,window_days,skip_days,strike_adjustment,simulated_pricing,0);
+        result.no_drop_profit_curve=no_drop.profit_curve;
+    }
     result.drop_scenario_count=scenario_count;
     return result;
 }

@@ -54,9 +54,9 @@ TEST_CASE("momentum analysis compares against the configured strike grid") {
         {"TEST","2024-01-02T00:00:00Z",0,0,0,13},
     };
     const auto above=options::analysis::analyze_momentum(
-        bars,1,1,options::analysis::StrikeAdjustment{2.5,1});
+        bars,1,1,options::analysis::StrikeAdjustment{2.5,2.5,1});
     const auto below=options::analysis::analyze_momentum(
-        bars,1,1,options::analysis::StrikeAdjustment{2.5,-1});
+        bars,1,1,options::analysis::StrikeAdjustment{2.5,2.5,-1});
     REQUIRE(above.losses==1);
     REQUIRE(above.wins==0);
     REQUIRE(below.wins==1);
@@ -69,12 +69,35 @@ TEST_CASE("momentum comparison price uses the second spread leg one strike width
         {"TEST","2024-01-02T00:00:00Z",0,0,0,13},
     };
     const auto result=options::analysis::analyze_momentum(
-        bars,1,1,options::analysis::StrikeAdjustment{2.5,-1},
+        bars,1,1,options::analysis::StrikeAdjustment{2.5,2.5,-1},
         options::analysis::SimulatedPricing{100,100,1000},0,0,true);
     REQUIRE(result.trades.size()==1);
     REQUIRE(result.trades.front().comparison_price==12.5);
     REQUIRE(result.trades.front().result==
         options::analysis::MomentumResult::TradeResult::itm);
+}
+
+TEST_CASE("momentum strike offsets move along the configured resolution grid") {
+    const auto pricing=options::analysis::SimulatedPricing{100,100,1000};
+    const std::vector<options::data::Bar> one_dollar_resolution{
+        {"SPY","2024-01-01T00:00:00Z",0,0,0,756.56},
+        {"SPY","2024-01-02T00:00:00Z",0,0,0,761},
+    };
+    const auto negative=options::analysis::analyze_momentum(
+        one_dollar_resolution,1,1,options::analysis::StrikeAdjustment{5,1,-2},
+        pricing,0,0,true);
+    REQUIRE(negative.trades.size()==1);
+    REQUIRE(negative.trades.front().comparison_price==760);
+
+    const std::vector<options::data::Bar> two_fifty_resolution{
+        {"TEST","2024-01-01T00:00:00Z",0,0,0,451.32},
+        {"TEST","2024-01-02T00:00:00Z",0,0,0,461},
+    };
+    const auto positive=options::analysis::analyze_momentum(
+        two_fifty_resolution,1,1,options::analysis::StrikeAdjustment{5,2.5,2},
+        pricing,0,0,true);
+    REQUIRE(positive.trades.size()==1);
+    REQUIRE(positive.trades.front().comparison_price==460);
 }
 
 TEST_CASE("momentum simulated pricing produces profit and ending allocation percentage") {
@@ -114,6 +137,29 @@ TEST_CASE("momentum generates an executed trade ledger only when requested") {
         options::analysis::MomentumResult::TradeResult::itm);
     REQUIRE(with_ledger.trades.back().result==
         options::analysis::MomentumResult::TradeResult::otm);
+}
+
+TEST_CASE("momentum summary mode preserves profits without constructing curves") {
+    const std::vector<options::data::Bar> bars{
+        {"TEST","2024-01-01T00:00:00Z",0,0,0,10},
+        {"TEST","2024-01-02T00:00:00Z",0,0,0,11},
+        {"TEST","2024-01-03T00:00:00Z",0,0,0,9},
+        {"TEST","2024-01-04T00:00:00Z",0,0,0,12},
+    };
+    const auto pricing=options::analysis::SimulatedPricing{200,300,1000};
+    const auto full=options::analysis::analyze_momentum_drop_scenarios(
+        bars,1,1,std::nullopt,pricing,50);
+    const auto summary=options::analysis::analyze_momentum_drop_scenarios(
+        bars,1,1,std::nullopt,pricing,50,5,false,false);
+    REQUIRE(summary.total_profit==full.total_profit);
+    REQUIRE(summary.profit_percentage==full.profit_percentage);
+    REQUIRE(summary.required_capital==full.required_capital);
+    REQUIRE(summary.comparisons==full.comparisons);
+    REQUIRE(summary.profit_curve.empty());
+    REQUIRE(summary.high_profit_curve.empty());
+    REQUIRE(summary.low_profit_curve.empty());
+    REQUIRE(summary.no_drop_profit_curve.empty());
+    REQUIRE(summary.trades.empty());
 }
 
 TEST_CASE("momentum simulated profit is averaged across skip phases") {
