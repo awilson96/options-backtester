@@ -574,6 +574,36 @@ private:
 
 QString averaged_count(double value);
 
+class LedgerTableWidget final : public QTableWidget {
+public:
+    using QTableWidget::QTableWidget;
+
+    void set_row_hover_callback(std::function<void(std::optional<int>)> callback) {
+        callback_=std::move(callback);
+        setMouseTracking(true);
+        viewport()->setMouseTracking(true);
+    }
+
+protected:
+    void mouseMoveEvent(QMouseEvent* event) override {
+        QTableWidget::mouseMoveEvent(event);
+        const auto row=indexAt(event->position().toPoint()).row();
+        if(row==hovered_row_) return;
+        hovered_row_=row;
+        if(callback_) callback_(row>=0 ? std::optional<int>(row) : std::nullopt);
+    }
+
+    void leaveEvent(QEvent* event) override {
+        hovered_row_=-1;
+        if(callback_) callback_(std::nullopt);
+        QTableWidget::leaveEvent(event);
+    }
+
+private:
+    std::function<void(std::optional<int>)> callback_;
+    int hovered_row_{-1};
+};
+
 class ProfitChartView final : public QChartView {
 public:
     explicit ProfitChartView(QChart* chart,QWidget* parent=nullptr) : QChartView(chart,parent) {
@@ -584,6 +614,41 @@ public:
     void set_hover_series(QLineSeries* no_drops,QLineSeries* high,QLineSeries* low,
                           QLineSeries* median) {
         hover_series_={{"No drops",no_drops},{"High",high},{"Low",low},{"Median",median}};
+        original_profit_pens_.clear();
+        for(const auto& [name,series]:hover_series_) {
+            Q_UNUSED(name);
+            original_profit_pens_.push_back(series ? series->pen() : QPen());
+        }
+    }
+
+    void set_underlying_series(QLineSeries* underlying) {
+        underlying_series_=underlying;
+        if(underlying_series_) original_underlying_pen_=underlying_series_->pen();
+    }
+
+    void highlight_trade(
+        std::optional<options::analysis::MomentumResult::TradeRecord> trade) {
+        if(trade && trade->result==options::analysis::MomentumResult::TradeResult::atm)
+            trade.reset();
+        highlighted_trade_=std::move(trade);
+        const QColor muted_colors[]{QColor("#d9e5f2"),QColor("#d8eed9"),
+                                    QColor("#f3dada"),QColor("#dddddd")};
+        for(std::size_t index=0;index<hover_series_.size();++index) {
+            auto* series=hover_series_[index].second;
+            if(!series) continue;
+            auto pen=index<original_profit_pens_.size() ? original_profit_pens_[index] : series->pen();
+            if(highlighted_trade_) pen.setColor(muted_colors[index]);
+            series->setPen(pen);
+        }
+        if(underlying_series_) {
+            auto pen=original_underlying_pen_;
+            if(highlighted_trade_) {
+                pen.setColor(Qt::black);
+                pen.setWidthF(2.0);
+            }
+            underlying_series_->setPen(pen);
+        }
+        viewport()->update();
     }
 
 protected:
@@ -607,9 +672,15 @@ protected:
 
     void paintEvent(QPaintEvent* event) override {
         QChartView::paintEvent(event);
+        QPainter painter(viewport());
+        painter.setRenderHint(QPainter::Antialiasing);
+        const auto plot=chart()->plotArea();
+        if(highlighted_trade_ && !hover_series_.empty() && hover_series_.front().second &&
+           underlying_series_)
+            paint_trade_highlight(painter,plot,*highlighted_trade_,
+                hover_series_.front().second,underlying_series_);
         if(!hovering_ || hover_series_.empty() || !hover_series_.front().second) return;
 
-        const auto plot=chart()->plotArea();
         const auto x=qBound(plot.left(),hover_position_.x(),plot.right());
         const auto chart_value=chart()->mapToValue(QPointF(x,plot.center().y()),hover_series_.front().second);
         const auto milliseconds=static_cast<qint64>(std::llround(chart_value.x()));
@@ -620,8 +691,6 @@ protected:
             lines.push_back(name+": "+(value ? "$"+QString::number(*value,'f',2) : QString("—")));
         }
 
-        QPainter painter(viewport());
-        painter.setRenderHint(QPainter::Antialiasing);
         painter.setPen(QPen(QColor("#777777"),1,Qt::DashLine));
         painter.drawLine(QPointF(x,plot.top()),QPointF(x,plot.bottom()));
 
@@ -648,6 +717,37 @@ protected:
     }
 
 private:
+    static void paint_trade_highlight(QPainter& painter,const QRectF& plot,
+        const options::analysis::MomentumResult::TradeRecord& trade,QLineSeries* date_reference,
+        QLineSeries* price_reference) {
+        const auto start_date=QDate::fromString(QString::fromStdString(trade.start_date),Qt::ISODate);
+        const auto end_date=QDate::fromString(QString::fromStdString(trade.end_date),Qt::ISODate);
+        const auto points=date_reference->points();
+        if(!start_date.isValid() || !end_date.isValid() || points.empty()) return;
+        const auto y=points.front().y();
+        const auto start_value=QDateTime(start_date,QTime(12,0),Qt::UTC).toMSecsSinceEpoch();
+        const auto end_value=QDateTime(end_date,QTime(12,0),Qt::UTC).toMSecsSinceEpoch();
+        const auto start_x=qBound(plot.left(),date_reference->chart()->mapToPosition(
+            QPointF(start_value,y),date_reference).x(),plot.right());
+        const auto end_x=qBound(plot.left(),date_reference->chart()->mapToPosition(
+            QPointF(end_value,y),date_reference).x(),plot.right());
+        const auto left=std::min(start_x,end_x);
+        const auto right=std::max(start_x,end_x);
+        const auto strike_y=qBound(plot.top(),price_reference->chart()->mapToPosition(
+            QPointF(start_value,trade.comparison_price),price_reference).y(),plot.bottom());
+        auto itm_fill=QColor("#66bb6a");
+        auto otm_fill=QColor("#ef5350");
+        itm_fill.setAlpha(48);
+        otm_fill.setAlpha(48);
+        painter.fillRect(QRectF(left,plot.top(),right-left,strike_y-plot.top()),itm_fill);
+        painter.fillRect(QRectF(left,strike_y,right-left,plot.bottom()-strike_y),otm_fill);
+        painter.setPen(QPen(QColor("#444444"),1.25));
+        painter.drawLine(QPointF(left,strike_y),QPointF(right,strike_y));
+        painter.setPen(QPen(QColor("#555555"),1.25,Qt::DashLine));
+        painter.drawLine(QPointF(start_x,plot.top()),QPointF(start_x,plot.bottom()));
+        painter.drawLine(QPointF(end_x,plot.top()),QPointF(end_x,plot.bottom()));
+    }
+
     static std::optional<double> value_at(const QLineSeries* series,double x) {
         if(!series) return std::nullopt;
         const auto points=series->points();
@@ -665,6 +765,10 @@ private:
     }
 
     std::vector<std::pair<QString,QLineSeries*>> hover_series_;
+    std::vector<QPen> original_profit_pens_;
+    QLineSeries* underlying_series_{};
+    QPen original_underlying_pen_;
+    std::optional<options::analysis::MomentumResult::TradeRecord> highlighted_trade_;
     QPointF hover_position_;
     bool hovering_{};
 };
@@ -747,6 +851,7 @@ void show_profit_chart(QWidget* parent,const QString& title,
     }
     auto* view=new ProfitChartView(chart);
     view->set_hover_series(no_drops_line,high_line,low_line,median_line);
+    view->set_underlying_series(underlying_line);
     view->setRenderHint(QPainter::Antialiasing);
     auto* content=new QSplitter(Qt::Vertical);
     content->addWidget(view);
@@ -757,7 +862,7 @@ void show_profit_chart(QWidget* parent,const QString& title,
         auto* ledger_label=new QLabel(
             "Median-scenario executed trades — phase identifies the skip-window start schedule");
         ledger_layout->addWidget(ledger_label);
-        auto* ledger=new QTableWidget(static_cast<int>(result.trades.size()),8);
+        auto* ledger=new LedgerTableWidget(static_cast<int>(result.trades.size()),8);
         ledger->setHorizontalHeaderLabels({"Start date","End date","Start price","End price",
             "Comparison price","Result","Phase","Contract P/L"});
         ledger->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -784,6 +889,18 @@ void show_profit_chart(QWidget* parent,const QString& title,
             ledger->setItem(row,7,new NumericTableWidgetItem(
                 "$"+QString::number(trade.profit,'f',2),trade.profit));
         }
+        ledger->set_row_hover_callback([view,&result](std::optional<int> row) {
+            if(!row || *row<0 || *row>=static_cast<int>(result.trades.size())) {
+                view->highlight_trade(std::nullopt);
+                return;
+            }
+            const auto& trade=result.trades[static_cast<std::size_t>(*row)];
+            if(trade.result==options::analysis::MomentumResult::TradeResult::atm) {
+                view->highlight_trade(std::nullopt);
+                return;
+            }
+            view->highlight_trade(trade);
+        });
         ledger_layout->addWidget(ledger,1);
         content->addWidget(ledger_container);
         content->setCollapsible(0,false);

@@ -269,6 +269,15 @@ averaged across multiple start schedules, the phase column identifies which
 schedule produced each execution. The generated ledger is reused for later opens
 of that row during the current session.
 
+Hovering over an ITM or OTM ledger row focuses its holding period on the chart.
+The four profit curves fade to light variants of their original colors, the
+underlying-price line becomes black, vertical guides mark the start and end dates,
+and a horizontal boundary marks that trade's computed comparison strike. Within
+the start-to-end interval, the area above the strike is shaded green and the area
+below it red. The boundary uses the exact strike grid and offset for the selected
+strategy row, including offsets such as -2 or +2. Moving away from the row restores
+the normal chart styling. ATM rows intentionally have no hover treatment yet.
+
 Simulated pricing also supports fixed slippage on neither side, the buy only, the
 sell only, or both buy and sell. Buy and sell slippage have independent inputs and
 are entered as dollars per share: `$0.04` means four cents per share, or `$4` per
