@@ -40,6 +40,7 @@
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSpinBox>
+#include <QSplitter>
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QTimer>
@@ -81,6 +82,9 @@ struct MomentumStudyRow {
     int skip_days{};
     int strike_offset{};
     options::analysis::MomentumResult result;
+    std::optional<options::analysis::StrikeAdjustment> strike_adjustment;
+    std::optional<options::analysis::SimulatedPricing> simulated_pricing;
+    double drop_rate{};
 };
 
 struct MomentumStudyRequest {
@@ -107,6 +111,14 @@ struct MomentumAnalysisOutput {
     bool from_cache{};
     bool open_profit_chart{};
     bool cache_miss{};
+};
+
+struct MomentumLedgerOutput {
+    std::size_t row_index{};
+    QString title;
+    options::analysis::MomentumResult result;
+    std::vector<options::data::Bar> bars;
+    QString error;
 };
 
 struct MomentumStudyPreset {
@@ -235,7 +247,7 @@ void delete_study_preset(const QString& id) {
 }
 
 constexpr quint32 analysis_cache_magic=0x4d4f4d43;
-constexpr quint32 analysis_cache_version=1;
+constexpr quint32 analysis_cache_version=3;
 
 void write_profit_curve(QDataStream& stream,
     const std::vector<options::analysis::MomentumResult::ProfitPoint>& curve) {
@@ -268,7 +280,12 @@ void write_momentum_result(QDataStream& stream,const options::analysis::Momentum
     write_profit_curve(stream,value.high_profit_curve);
     write_profit_curve(stream,value.low_profit_curve);
     write_profit_curve(stream,value.no_drop_profit_curve);
-    stream<<static_cast<quint64>(value.drop_scenario_count);
+    stream<<static_cast<quint64>(value.drop_scenario_count)
+          <<static_cast<quint64>(value.trades.size());
+    for(const auto& trade:value.trades)
+        stream<<QString::fromStdString(trade.start_date)<<QString::fromStdString(trade.end_date)
+              <<trade.start_price<<trade.end_price<<trade.comparison_price<<trade.profit
+              <<static_cast<quint64>(trade.phase)<<static_cast<qint32>(trade.result);
 }
 
 bool read_momentum_result(QDataStream& stream,options::analysis::MomentumResult& value) {
@@ -282,6 +299,27 @@ bool read_momentum_result(QDataStream& stream,options::analysis::MomentumResult&
     quint64 scenarios{};
     stream>>scenarios;
     value.drop_scenario_count=static_cast<std::size_t>(scenarios);
+    quint64 trade_count{};
+    stream>>trade_count;
+    if(trade_count>10000000) return false;
+    value.trades.clear();
+    value.trades.reserve(static_cast<std::size_t>(trade_count));
+    for(quint64 index=0;index<trade_count;++index) {
+        options::analysis::MomentumResult::TradeRecord trade;
+        QString start_date,end_date;
+        quint64 phase{};
+        qint32 result{};
+        stream>>start_date>>end_date>>trade.start_price>>trade.end_price
+              >>trade.comparison_price>>trade.profit>>phase>>result;
+        if(result<static_cast<qint32>(options::analysis::MomentumResult::TradeResult::itm) ||
+           result>static_cast<qint32>(options::analysis::MomentumResult::TradeResult::atm))
+            return false;
+        trade.start_date=start_date.toStdString();
+        trade.end_date=end_date.toStdString();
+        trade.phase=static_cast<std::size_t>(phase);
+        trade.result=static_cast<options::analysis::MomentumResult::TradeResult>(result);
+        value.trades.push_back(std::move(trade));
+    }
     return stream.status()==QDataStream::Ok;
 }
 
@@ -337,6 +375,16 @@ void save_cached_analysis(const QString& key,const MomentumAnalysisOutput& outpu
     for(const auto& row:output.study_rows) {
         stream<<row.window_days<<row.skip_days<<row.strike_offset;
         write_momentum_result(stream,row.result);
+        stream<<row.strike_adjustment.has_value();
+        if(row.strike_adjustment)
+            stream<<row.strike_adjustment->width<<row.strike_adjustment->offset;
+        stream<<row.simulated_pricing.has_value();
+        if(row.simulated_pricing)
+            stream<<row.simulated_pricing->max_profit<<row.simulated_pricing->max_loss
+                  <<row.simulated_pricing->allocation<<row.simulated_pricing->buy_slippage_per_share
+                  <<row.simulated_pricing->sell_slippage_per_share
+                  <<static_cast<qint32>(row.simulated_pricing->slippage_mode);
+        stream<<row.drop_rate;
     }
     stream<<output.single_result.has_value();
     if(output.single_result) write_momentum_result(stream,*output.single_result);
@@ -375,6 +423,27 @@ std::optional<CachedMomentumAnalysis> load_cached_analysis(const QString& key) {
         MomentumStudyRow row;
         stream>>row.window_days>>row.skip_days>>row.strike_offset;
         if(!read_momentum_result(stream,row.result)) return std::nullopt;
+        bool has_adjustment{};
+        stream>>has_adjustment;
+        if(has_adjustment) {
+            row.strike_adjustment.emplace();
+            stream>>row.strike_adjustment->width>>row.strike_adjustment->offset;
+        }
+        bool has_pricing{};
+        stream>>has_pricing;
+        if(has_pricing) {
+            row.simulated_pricing.emplace();
+            qint32 slippage_mode{};
+            stream>>row.simulated_pricing->max_profit>>row.simulated_pricing->max_loss
+                  >>row.simulated_pricing->allocation>>row.simulated_pricing->buy_slippage_per_share
+                  >>row.simulated_pricing->sell_slippage_per_share>>slippage_mode;
+            if(slippage_mode<static_cast<qint32>(options::analysis::SlippageMode::none) ||
+               slippage_mode>static_cast<qint32>(options::analysis::SlippageMode::buy_and_sell))
+                return std::nullopt;
+            row.simulated_pricing->slippage_mode=
+                static_cast<options::analysis::SlippageMode>(slippage_mode);
+        }
+        stream>>row.drop_rate;
         cached.output.study_rows.push_back(std::move(row));
     }
     bool has_single{};
@@ -605,7 +674,9 @@ void show_profit_chart(QWidget* parent,const QString& title,
                        std::span<const options::data::Bar> underlying_bars) {
     QDialog dialog(parent);
     dialog.setWindowTitle("Simulated Profit — "+title);
-    dialog.resize(900,600);
+    dialog.setWindowFlag(Qt::WindowMaximizeButtonHint,true);
+    dialog.setSizeGripEnabled(true);
+    dialog.resize(1200,850);
     auto* layout=new QVBoxLayout(&dialog);
     auto* chart=new QChart;
     chart->setTitle("Simulated account value — one contract, averaged across start phases");
@@ -677,7 +748,51 @@ void show_profit_chart(QWidget* parent,const QString& title,
     auto* view=new ProfitChartView(chart);
     view->set_hover_series(no_drops_line,high_line,low_line,median_line);
     view->setRenderHint(QPainter::Antialiasing);
-    layout->addWidget(view,1);
+    auto* content=new QSplitter(Qt::Vertical);
+    content->addWidget(view);
+    if(!result.trades.empty()) {
+        auto* ledger_container=new QWidget;
+        auto* ledger_layout=new QVBoxLayout(ledger_container);
+        ledger_layout->setContentsMargins(0,0,0,0);
+        auto* ledger_label=new QLabel(
+            "Median-scenario executed trades — phase identifies the skip-window start schedule");
+        ledger_layout->addWidget(ledger_label);
+        auto* ledger=new QTableWidget(static_cast<int>(result.trades.size()),8);
+        ledger->setHorizontalHeaderLabels({"Start date","End date","Start price","End price",
+            "Comparison price","Result","Phase","Contract P/L"});
+        ledger->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        ledger->setSelectionBehavior(QAbstractItemView::SelectRows);
+        ledger->setAlternatingRowColors(true);
+        ledger->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+        ledger->horizontalHeader()->setStretchLastSection(true);
+        for(int row=0;row<static_cast<int>(result.trades.size());++row) {
+            const auto& trade=result.trades[static_cast<std::size_t>(row)];
+            const auto result_text=trade.result==options::analysis::MomentumResult::TradeResult::itm
+                ? "ITM" : trade.result==options::analysis::MomentumResult::TradeResult::otm
+                    ? "OTM" : "ATM";
+            ledger->setItem(row,0,new QTableWidgetItem(QString::fromStdString(trade.start_date)));
+            ledger->setItem(row,1,new QTableWidgetItem(QString::fromStdString(trade.end_date)));
+            ledger->setItem(row,2,new NumericTableWidgetItem(
+                "$"+QString::number(trade.start_price,'f',2),trade.start_price));
+            ledger->setItem(row,3,new NumericTableWidgetItem(
+                "$"+QString::number(trade.end_price,'f',2),trade.end_price));
+            ledger->setItem(row,4,new NumericTableWidgetItem(
+                "$"+QString::number(trade.comparison_price,'f',2),trade.comparison_price));
+            ledger->setItem(row,5,new QTableWidgetItem(result_text));
+            ledger->setItem(row,6,new NumericTableWidgetItem(
+                QString::number(trade.phase+1),static_cast<double>(trade.phase+1)));
+            ledger->setItem(row,7,new NumericTableWidgetItem(
+                "$"+QString::number(trade.profit,'f',2),trade.profit));
+        }
+        ledger_layout->addWidget(ledger,1);
+        content->addWidget(ledger_container);
+        content->setCollapsible(0,false);
+        content->setCollapsible(1,false);
+        content->setStretchFactor(0,7);
+        content->setStretchFactor(1,3);
+        content->setSizes({700,300});
+    }
+    layout->addWidget(content,1);
     auto* summary=new QLabel("Allocation: $"+QString::number(result.allocation,'f',2)+
         "    Capital needed: $"+QString::number(result.required_capital,'f',2)+
         "    Avg skipped trades: "+averaged_count(result.skipped_comparisons)+
@@ -1234,17 +1349,61 @@ private:
                 study_table->sortItems(column,order);
             });
 
+        auto* ledger_watcher=new QFutureWatcher<MomentumLedgerOutput>(&dialog);
+        connect(ledger_watcher,&QFutureWatcher<MomentumLedgerOutput>::finished,&dialog,[&] {
+            study_table->setEnabled(true);
+            analyze_button->setEnabled(true);
+            save_button->setEnabled(true);
+            analysis_activity->setVisible(false);
+            auto output=ledger_watcher->result();
+            if(!output.error.isEmpty()) {
+                analysis_status->setText("Ledger generation failed: "+output.error);
+                return;
+            }
+            if(output.row_index>=study_rows.size()) return;
+            study_rows[output.row_index].result=output.result;
+            analysis_status->setText(
+                "Generated "+QString::number(output.result.trades.size())+
+                " executed-trade ledger rows for the selected median scenario.");
+            show_profit_chart(&dialog,output.title,output.result,output.bars);
+        });
         connect(study_table,&QTableWidget::cellDoubleClicked,&dialog,
             [&](int row,int) {
-                if(!simulated_pricing->isChecked()) return;
+                if(ledger_watcher->isRunning()) return;
                 const auto* item=study_table->item(row,0);
                 if(!item) return;
                 const auto index=item->data(Qt::UserRole).toULongLong();
                 if(index>=study_rows.size()) return;
                 const auto& value=study_rows[static_cast<std::size_t>(index)];
-                show_profit_chart(&dialog,analyzed_symbol+"  x="+QString::number(value.window_days)+
+                if(!value.simulated_pricing) return;
+                const auto title=analyzed_symbol+"  x="+QString::number(value.window_days)+
                     " d="+QString::number(value.skip_days)+
-                    " strike="+QString::number(value.strike_offset),value.result,analyzed_bars);
+                    " strike="+QString::number(value.strike_offset);
+                if(!value.result.trades.empty()) {
+                    show_profit_chart(&dialog,title,value.result,analyzed_bars);
+                    return;
+                }
+                study_table->setEnabled(false);
+                analyze_button->setEnabled(false);
+                save_button->setEnabled(false);
+                analysis_activity->setVisible(true);
+                analysis_status->setText("Generating the selected row's median-scenario trade ledger…");
+                ledger_watcher->setFuture(QtConcurrent::run(
+                    [bars=analyzed_bars,value,title,index=static_cast<std::size_t>(index)]() mutable {
+                        MomentumLedgerOutput output;
+                        output.row_index=index;
+                        output.title=title;
+                        output.bars=bars;
+                        try {
+                            output.result=options::analysis::analyze_momentum_drop_scenarios(
+                                bars,static_cast<std::size_t>(value.window_days),
+                                static_cast<std::size_t>(value.skip_days),value.strike_adjustment,
+                                value.simulated_pricing,value.drop_rate,5,true);
+                        } catch(const std::exception& error) {
+                            output.error=QString::fromUtf8(error.what());
+                        }
+                        return output;
+                    }));
             });
 
         const auto expand_dialog_for=[&dialog](int minimum_width,int minimum_height) {
@@ -1677,7 +1836,8 @@ private:
                                         request.strike_offset,options::analysis::analyze_momentum_drop_scenarios(
                                             bars,static_cast<std::size_t>(request.window_days),
                                             static_cast<std::size_t>(request.skip_days),request.strike_adjustment,
-                                            request.simulated_pricing,rate)});
+                                            request.simulated_pricing,rate),request.strike_adjustment,
+                                        request.simulated_pricing,rate});
                                 }
                             } else {
                                 const auto& request=requests.front();

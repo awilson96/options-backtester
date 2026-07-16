@@ -12,6 +12,21 @@
 namespace options::analysis {
 
 struct MomentumResult {
+    enum class TradeResult {
+        itm,
+        otm,
+        atm,
+    };
+    struct TradeRecord {
+        std::string start_date;
+        std::string end_date;
+        double start_price{};
+        double end_price{};
+        double comparison_price{};
+        double profit{};
+        std::size_t phase{};
+        TradeResult result{TradeResult::atm};
+    };
     double comparisons{};
     double skipped_comparisons{};
     double dropped_comparisons{};
@@ -32,6 +47,7 @@ struct MomentumResult {
     std::vector<ProfitPoint> high_profit_curve;
     std::vector<ProfitPoint> low_profit_curve;
     std::vector<ProfitPoint> no_drop_profit_curve;
+    std::vector<TradeRecord> trades;
     std::size_t drop_scenario_count{};
 };
 
@@ -60,12 +76,14 @@ struct SimulatedPricing {
     std::span<const data::Bar> bars, std::size_t window_days, std::size_t skip_days=1,
     std::optional<StrikeAdjustment> strike_adjustment=std::nullopt,
     std::optional<SimulatedPricing> simulated_pricing=std::nullopt,
-    double drop_rate_percent=0.0, std::uint64_t drop_seed=0);
+    double drop_rate_percent=0.0, std::uint64_t drop_seed=0,
+    bool collect_trades=false);
 
 [[nodiscard]] MomentumResult analyze_momentum_drop_scenarios(
     std::span<const data::Bar> bars, std::size_t window_days, std::size_t skip_days,
     std::optional<StrikeAdjustment> strike_adjustment,
     std::optional<SimulatedPricing> simulated_pricing,
-    double drop_rate_percent, std::size_t scenario_count=5);
+    double drop_rate_percent, std::size_t scenario_count=5,
+    bool collect_trades=false);
 
 }  // namespace options::analysis

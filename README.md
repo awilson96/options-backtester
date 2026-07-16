@@ -257,6 +257,18 @@ phases in the same way as the momentum statistics. Parametric table headers use
 **DTE**, **Skip**, and **Win Rate %**, omit the average-ties and Rank columns, and
 use the table's built-in row numbers for the current rank.
 
+Trade ledgers are generated on demand rather than during the parametric sweep.
+Double-clicking a simulated-pricing result row reconstructs only that row's
+deterministic median drop scenario on the background worker, then opens its
+four-line profit chart with an executed-trades table underneath. The ledger lists
+start and end dates, underlying start and end prices, comparison price, ITM/OTM
+(or ATM for an exact tie), skip-start phase, and realized one-contract profit or
+loss. Only funded executions are included; dropped opportunities and trades
+skipped for insufficient capital are excluded. Because skip values above one are
+averaged across multiple start schedules, the phase column identifies which
+schedule produced each execution. The generated ledger is reused for later opens
+of that row during the current session.
+
 Simulated pricing also supports fixed slippage on neither side, the buy only, the
 sell only, or both buy and sell. Buy and sell slippage have independent inputs and
 are entered as dollars per share: `$0.04` means four cents per share, or `$4` per

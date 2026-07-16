@@ -79,6 +79,29 @@ TEST_CASE("momentum simulated pricing produces profit and ending allocation perc
     REQUIRE(result.profit_curve.back().cumulative_profit==-100);
 }
 
+TEST_CASE("momentum generates an executed trade ledger only when requested") {
+    const std::vector<options::data::Bar> bars{
+        {"TEST","2024-01-01T00:00:00Z",0,0,0,10},
+        {"TEST","2024-01-02T00:00:00Z",0,0,0,11},
+        {"TEST","2024-01-03T00:00:00Z",0,0,0,9},
+    };
+    const auto pricing=options::analysis::SimulatedPricing{200,300,1000};
+    const auto normal=options::analysis::analyze_momentum(
+        bars,1,1,std::nullopt,pricing);
+    const auto with_ledger=options::analysis::analyze_momentum(
+        bars,1,1,std::nullopt,pricing,0,0,true);
+    REQUIRE(normal.trades.empty());
+    REQUIRE(with_ledger.trades.size()==2);
+    REQUIRE(with_ledger.trades.front().start_date=="2024-01-01");
+    REQUIRE(with_ledger.trades.front().end_date=="2024-01-02");
+    REQUIRE(with_ledger.trades.front().start_price==10);
+    REQUIRE(with_ledger.trades.front().end_price==11);
+    REQUIRE(with_ledger.trades.front().result==
+        options::analysis::MomentumResult::TradeResult::itm);
+    REQUIRE(with_ledger.trades.back().result==
+        options::analysis::MomentumResult::TradeResult::otm);
+}
+
 TEST_CASE("momentum simulated profit is averaged across skip phases") {
     const std::vector<options::data::Bar> bars{
         {"TEST","2024-01-01T00:00:00Z",0,0,0,10},
