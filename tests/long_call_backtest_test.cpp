@@ -40,3 +40,17 @@ TEST_CASE("long call rejects crossed markets") {
     REQUIRE(result.strategy.final_equity==1000.0);
     REQUIRE(result.rejected_markets==2);
 }
+
+TEST_CASE("long call benchmark uses the session open and close from minute bars") {
+    const std::vector<options::data::OptionObservation> observations{
+        observation("2026-01-05",2.1,2.0), observation("2026-01-06",2.1,2.0)};
+    const options::data::Bar bars[]{
+        {"SPY","2026-01-05T14:30:00Z",100,101,99,100,100,10,100},
+        {"SPY","2026-01-05T20:59:00Z",101,102,100,101,100,10,101},
+        {"SPY","2026-01-06T14:30:00Z",102,103,101,102,100,10,102},
+        {"SPY","2026-01-06T20:59:00Z",110,111,109,110,100,10,110}};
+    options::backtest::LongCallConfig config; config.initial_cash=1000;
+    const auto result=options::backtest::run_long_call_strategy(observations,bars,config);
+    REQUIRE(result.buy_hold_equity.front().value==1010.0);
+    REQUIRE(result.buy_hold_equity.back().value==1100.0);
+}

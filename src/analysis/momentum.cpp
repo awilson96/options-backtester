@@ -1,6 +1,6 @@
 #include "options/analysis/momentum.hpp"
 
-#include <QDate>
+#include <QDateTime>
 
 #include <algorithm>
 #include <cmath>
@@ -15,7 +15,7 @@ namespace options::analysis {
 namespace {
 
 struct Observation {
-    QDate date;
+    QDateTime timestamp;
     std::string symbol;
     double price{};
 };
@@ -57,7 +57,8 @@ bool should_drop(const Observation& observation,double drop_rate_percent,std::ui
     if(drop_rate_percent<=0) return false;
     if(drop_rate_percent>=100) return true;
     std::uint64_t hash=1469598103934665603ULL^drop_seed;
-    const auto key=observation.symbol+observation.date.toString(Qt::ISODate).toStdString();
+    const auto key=observation.symbol+
+        observation.timestamp.toString(Qt::ISODateWithMs).toStdString();
     for(const auto character:key) {
         hash^=static_cast<unsigned char>(character);
         hash*=1099511628211ULL;
@@ -95,20 +96,23 @@ MomentumResult analyze_momentum(
     std::vector<Observation> observations;
     observations.reserve(bars.size());
     for(const auto& bar:bars) {
-        const auto date=QDate::fromString(QString::fromStdString(bar.timestamp.substr(0,10)),Qt::ISODate);
+        const auto timestamp=QDateTime::fromString(
+            QString::fromStdString(bar.timestamp),Qt::ISODate);
         const auto price=std::isfinite(bar.vwap) && bar.vwap>0 ? bar.vwap : bar.close;
-        if(date.isValid() && std::isfinite(price) && price>0)
-            observations.push_back({date,bar.symbol,price});
+        if(timestamp.isValid() && std::isfinite(price) && price>0)
+            observations.push_back({timestamp,bar.symbol,price});
     }
-    std::ranges::sort(observations,{},&Observation::date);
+    std::ranges::sort(observations,{},&Observation::timestamp);
     if(observations.empty()) return {};
 
     std::vector<std::size_t> right_indices(observations.size(),observations.size());
     for(std::size_t index=0;index<observations.size();++index) {
-        const auto target=observations[index].date.addDays(static_cast<qint64>(window_days));
+        const auto target=observations[index].timestamp.addDays(static_cast<qint64>(window_days));
         const auto right=std::lower_bound(std::next(observations.begin(),static_cast<std::ptrdiff_t>(index+1)),
             observations.end(),target,
-            [](const Observation& observation,const QDate& date){return observation.date<date;});
+            [](const Observation& observation,const QDateTime& timestamp) {
+                return observation.timestamp<timestamp;
+            });
         if(right!=observations.end())
             right_indices[index]=static_cast<std::size_t>(std::distance(observations.begin(),right));
     }
@@ -119,15 +123,17 @@ MomentumResult analyze_momentum(
     const auto friction=simulated_pricing ? slippage_cost(*simulated_pricing) : 0.0;
     for(std::size_t phase=0;phase<skip_days;++phase) {
         std::vector<ScheduledTrade> scheduled;
-        auto next_eligible_date=observations.front().date.addDays(static_cast<qint64>(phase));
+        auto next_eligible_timestamp=
+            observations.front().timestamp.addDays(static_cast<qint64>(phase));
         for(std::size_t left=0;left<observations.size();++left) {
-            if(observations[left].date<next_eligible_date) continue;
+            if(observations[left].timestamp<next_eligible_timestamp) continue;
             if(right_indices[left]==observations.size()) break;
             const auto& right=observations[right_indices[left]];
             const auto threshold=comparison_price(observations[left].price,strike_adjustment);
             if(should_drop(observations[left],drop_rate_percent,drop_seed)) {
                 ++result.dropped_comparisons;
-                next_eligible_date=observations[left].date.addDays(static_cast<qint64>(skip_days));
+                next_eligible_timestamp=
+                    observations[left].timestamp.addDays(static_cast<qint64>(skip_days));
                 continue;
             }
             ScheduledTrade trade{left,right_indices[left],Outcome::tie,0};
@@ -139,7 +145,8 @@ MomentumResult analyze_momentum(
                 if(simulated_pricing) trade.profit=-(simulated_pricing->max_loss+friction);
             }
             scheduled.push_back(trade);
-            next_eligible_date=observations[left].date.addDays(static_cast<qint64>(skip_days));
+            next_eligible_timestamp=
+                observations[left].timestamp.addDays(static_cast<qint64>(skip_days));
         }
 
         MomentumResult phase_result;
@@ -157,8 +164,8 @@ MomentumResult analyze_momentum(
                         ? MomentumResult::TradeResult::otm
                         : MomentumResult::TradeResult::atm;
                 phase_result.trades.push_back({
-                    start.date.toString(Qt::ISODate).toStdString(),
-                    end.date.toString(Qt::ISODate).toStdString(),start.price,end.price,
+                    start.timestamp.toString(Qt::ISODateWithMs).toStdString(),
+                    end.timestamp.toString(Qt::ISODateWithMs).toStdString(),start.price,end.price,
                     comparison_price(start.price,strike_adjustment),trade.profit,phase,trade_result,
                     money_at_risk});
             }
@@ -193,7 +200,7 @@ MomentumResult analyze_momentum(
                 balance+=trade.profit;
                 total_profit+=trade.profit;
                 if(collect_profit_curves)
-                    profit_changes[observations[trade.exit].date]+=trade.profit;
+                    profit_changes[observations[trade.exit].timestamp.date()]+=trade.profit;
             };
             for(const auto& trade:scheduled) {
                 while(!funded_open.empty() && funded_open.front()->exit<=trade.entry) {
@@ -244,7 +251,7 @@ MomentumResult analyze_momentum(
         if(collect_profit_curves) {
             double cumulative=0;
             result.profit_curve.push_back(
-                {observations.front().date.toString(Qt::ISODate).toStdString(),0});
+                {observations.front().timestamp.date().toString(Qt::ISODate).toStdString(),0});
             for(const auto& [date,change]:profit_changes) {
                 cumulative+=change/phases;
                 result.profit_curve.push_back({date.toString(Qt::ISODate).toStdString(),cumulative});

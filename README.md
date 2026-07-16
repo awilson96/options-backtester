@@ -31,9 +31,14 @@ export ALPACA_DATA_FEED="iex"
 export ALPACA_OPTION_FEED="indicative"
 
 ./build/debug/options-backtester download-bars \
-  --symbols SPY,AAPL --start 2024-01-01 --end 2024-02-01 --timeframe 1Day
+  --symbols SPY,AAPL --start 2024-01-01 --end 2024-02-01
 ./build/debug/options-backtester count-bars --symbol SPY
 ```
+
+Stock downloads default to Alpaca's finest supported bar resolution, `1Min`.
+Pass a different `--timeframe` explicitly only when coarser aggregates are wanted.
+Minute history contains substantially more rows than daily history, so broad date
+ranges take longer to download, store, analyze, and draw.
 
 The default database is `market-data.db`. Repeating a download updates matching
 records rather than creating duplicates. Successfully downloaded date ranges are
@@ -56,7 +61,7 @@ volume and trade counts.
 ## Run the deterministic equity comparison
 
 The initial strategy is a long-only moving-average crossover. A signal is formed
-from completed closing prices and is executed at the next session's open. Both
+from completed bar closing prices and is executed at the next bar's open. Both
 the strategy and buy-and-hold use the same starting cash and whole shares. This
 initial model has no commissions, slippage, dividends, or fractional shares.
 
@@ -66,7 +71,9 @@ initial model has no commissions, slippage, dividends, or fractional shares.
   --short-window 20 --long-window 50 --cash 10000
 ```
 
-The selected period must contain more bars than the long SMA window. The command
+The SMA window values count bars, so the defaults are 20 and 50 minutes when using
+the default `1Min` stock data. The selected period must contain more bars than the
+long SMA window. The command
 prints final equity, total and annualized return, maximum drawdown, order count,
 buy-and-hold results, and excess total return.
 
@@ -149,8 +156,9 @@ snapshot sessions. Crossed, missing, non-positive, or excessively wide markets
 are rejected. Open interest is copied into each snapshot when collected so later
 contract updates cannot leak into older decisions.
 
-The strategy requires at least two days of snapshots plus overlapping daily
-underlying bars:
+The strategy requires at least two days of snapshots plus overlapping one-minute
+underlying bars. The first and final underlying bars in each session supply that
+session's benchmark open and close:
 
 ```bash
 ./build/debug/options-backtester backtest-long-call \
@@ -174,20 +182,34 @@ Launch the native Qt viewer without command-line options:
 
 The viewer opens `market-data.db` automatically when launched from the repository
 and remembers the last database selected with **Open Database**. Its symbol and
-date selectors are populated from stored IEX daily equity bars. Switching symbols
-or changing either date updates the chart, and each symbol's selected date range
+date selectors are populated from stored IEX one-minute equity bars. Switching
+symbols or changing either date updates the chart, and each symbol's selected date range
 is restored between sessions. Hold **Ctrl** while scrolling over the chart to move
 the selected date window left or right along the available timeline. Every five
 consecutive scroll events in one direction moves it by one step.
+Hovering over the underlying chart snaps a dashed vertical guide to the nearest
+displayed candle and shows its timestamp, OHLC, and volume in a box to the
+left of the guide. Timestamps use the `America/New_York` time zone, including the
+EST/EDT daylight-saving transition. Only regular market hours from 9:30 a.m. up
+to 4:00 p.m. Eastern are plotted. Closed and missing periods are removed from the
+horizontal scale, so one session's final candle is followed immediately by the
+next session's 9:30 a.m. candle. Aggregated observations are drawn with high/low
+whiskers, a green body when close is above open, and a red body when close is
+below open. A single-day view defaults to **1 Min** candles; any multi-day view
+defaults to **1 Day** candles. The **Candles** dropdown at the top right can
+override that default with **1 Day**, **1 Hour**, **30 Min**, **15 Min**, **5 Min**,
+or **1 Min**. Intraday buckets are anchored at the 9:30 a.m. open, so the final
+1-hour candle contains the last 30 minutes of the regular session.
 
 Choose **Momentum** from the chart's strategy dropdown to open its analysis
 dialog. By default it evaluates a 30-day rolling window over the latest year
-of stored data. For each trading date q, r is the first trading date on or after
-q plus the configured number of calendar days. The default window is 30 days.
+of stored data. For each bar q, r is the first stored bar at or after q's exact
+timestamp plus the configured number of calendar days. The default window is 30
+days.
 The skip window d controls how often a new comparison begins and defaults to one
 day; for example, d=4 makes a Monday entry next eligible on Friday. If an eligible
 date is not a trading day, the next stored trading day is used. The dialog reports
-how often the daily analysis price at r was greater than at q, along with win, loss,
+how often the one-minute analysis price at r was greater than at q, along with win, loss,
 tie, and total comparison counts. Both windows and the analysis date range are
 configurable.
 
@@ -211,22 +233,22 @@ be adjusted before running or saving again.
 
 Selecting **Save Study…** stores the study parameters and, when those exact
 settings have just been run, the completed single result or parametric table,
-summary statistics, and underlying daily bars. Single-result studies retain their
+summary statistics, and underlying one-minute bars. Single-result studies retain their
 chart data, while parametric studies save summaries only. A saved study restores that
 result when explicitly loaded and does not open a profit-chart popup until a table
 row is selected. Pressing **Run Analysis** always performs a fresh calculation;
 there is no automatic result-cache lookup or reuse. If the displayed parameters
 have not been run, only the study template is saved.
 
-Momentum uses each daily bar's VWAP as the analysis price, falling back to close
+Momentum uses each one-minute bar's VWAP as the analysis price, falling back to close
 only when VWAP is unavailable. **Drop rate** is a fixed, non-parametric percentage
-of otherwise eligible entries treated as unfillable. Dropped dates are selected
-using five reproducible pseudo-random symbol/date scenarios per strategy row. Table
+of otherwise eligible entries treated as unfillable. Dropped entries are selected
+using five reproducible pseudo-random symbol/timestamp scenarios per strategy row. Table
 statistics use the scenario with median total profit. Profit charts show the high
 scenario in green, low in red, median in black, and a zero-drop baseline as a blue
 dotted line. Hovering over a profit chart displays a vertical date guide and a
 pastel-grey summary containing the date plus the no-drop, high, low, and median
-account values at that position. The underlying asset's daily analysis price is
+account values at that position. The underlying asset's one-minute analysis price is
 drawn in very light grey against a separate price axis on the right. It shares the
 chart's date axis but cannot change the account-value scale on the left. No
 additional scenario columns are added to the parametric table.
@@ -352,8 +374,8 @@ parametric or simulated-pricing controls need additional room. Result columns ke
 readable widths and scroll horizontally when necessary, while large collections
 of strike-pricing inputs scroll vertically instead of compressing other fields.
 
-The **Load Data** tab downloads IEX daily bars for a new symbol into the currently
+The **Load Data** tab downloads IEX one-minute bars for a new symbol into the currently
 open database using `ALPACA_API_KEY` and `ALPACA_API_SECRET`. Its date selectors
-default to Alpaca's maximum supported market-calendar range, 1970-01-01 through
-today, and can be narrowed before loading. Previously covered ranges are read from
+default to the latest year to keep one-minute downloads manageable, but the start
+can be moved as far back as 1970-01-01. Previously covered ranges are read from
 the local cache, so only missing ranges are requested from Alpaca.

@@ -83,7 +83,8 @@ options::data::BarQuery bar_query(const std::unordered_map<std::string, std::str
     const char* feed_value = std::getenv("ALPACA_DATA_FEED");
     return {required(args, "symbol"), "alpaca",
             optional(args, "feed", feed_value && *feed_value ? feed_value : "iex"),
-            optional(args, "timeframe", "1Day"), optional(args, "adjustment", "all"),
+            optional(args, "timeframe", options::data::stock_bar_timeframe),
+            optional(args, "adjustment", "all"),
             optional(args, "start"), optional(args, "end")};
 }
 
@@ -114,7 +115,7 @@ std::vector<std::string> split_symbols(const std::string& value) {
 void usage() {
     std::cout << "Usage:\n"
               << "  options-backtester download-bars --symbols SPY,AAPL --start YYYY-MM-DD "
-                 "--end YYYY-MM-DD [--timeframe 1Day] [--db market-data.db]\n"
+                 "--end YYYY-MM-DD [--timeframe 1Min] [--db market-data.db]\n"
               << "    Add --refresh to bypass cached download coverage.\n"
               << "  options-backtester count-bars --symbol SPY [--db market-data.db]\n"
               << "  options-backtester validate-bars --symbol SPY [--start YYYY-MM-DD] "
@@ -330,7 +331,8 @@ int main(int argc, char** argv) {
             const char* equity_feed_value=std::getenv("ALPACA_DATA_FEED");
             const std::string equity_feed=optional(
                 args,"equity-feed",equity_feed_value && *equity_feed_value ? equity_feed_value : "iex");
-            const auto bars=store.load({underlying,"alpaca",equity_feed,"1Day","all",start,end});
+            const auto bars=store.load({underlying,"alpaca",equity_feed,
+                options::data::stock_bar_timeframe,"all",start,end});
             options::backtest::LongCallConfig config;
             config.initial_cash=number(args,"cash",10000.0);
             config.target_delta=number(args,"target-delta",0.50);
@@ -359,8 +361,6 @@ int main(int argc, char** argv) {
             auto query = bar_query(args);
             query.start = required(args, "start");
             query.end = required(args, "end");
-            if (query.timeframe != "1Day")
-                throw std::runtime_error("backtest-sma currently requires --timeframe 1Day");
             const auto bars = store.load(query);
             const auto report = options::data::validate_bars(bars);
             if (!report.valid()) throw std::runtime_error("stored bars failed validation");
@@ -388,6 +388,7 @@ int main(int argc, char** argv) {
 
         const char* feed_value = std::getenv("ALPACA_DATA_FEED");
         options::providers::alpaca::BarsRequest request;
+        request.timeframe = options::data::stock_bar_timeframe;
         request.symbols = split_symbols(required(args, "symbols"));
         request.start = required(args, "start");
         request.end = required(args, "end");

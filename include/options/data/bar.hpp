@@ -5,6 +5,8 @@
 
 namespace options::data {
 
+inline constexpr char stock_bar_timeframe[] = "1Min";
+
 struct Bar {
     std::string symbol;
     std::string timestamp;
@@ -20,4 +22,3 @@ struct Bar {
 bool operator==(const Bar& lhs, const Bar& rhs);
 
 }  // namespace options::data
-

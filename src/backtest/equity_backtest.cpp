@@ -1,5 +1,7 @@
 #include "options/backtest/equity_backtest.hpp"
 
+#include <QDateTime>
+
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -8,14 +10,15 @@
 namespace options::backtest {
 namespace {
 
-PerformanceMetrics metrics(double initial, std::span<const double> equity, std::size_t orders) {
+PerformanceMetrics metrics(double initial, std::span<const double> equity, std::size_t orders,
+                           double elapsed_years) {
     PerformanceMetrics result;
     result.initial_equity = initial;
     result.final_equity = equity.back();
     result.total_return = result.final_equity / initial - 1.0;
-    if (equity.size() > 1 && result.final_equity > 0) {
+    if (elapsed_years > 0 && result.final_equity > 0) {
         result.annualized_return =
-            std::pow(result.final_equity / initial, 252.0 / (equity.size() - 1)) - 1.0;
+            std::pow(result.final_equity / initial, 1.0 / elapsed_years) - 1.0;
     }
     double peak = equity.front();
     for (const double value : equity) {
@@ -77,8 +80,16 @@ EquityComparison run_sma_comparison(std::span<const data::Bar> bars, double init
     result.bars = bars.size();
     result.short_window = short_window;
     result.long_window = long_window;
-    result.strategy = metrics(initial_cash, strategy_equity, orders);
-    result.buy_and_hold = metrics(initial_cash, buy_hold_equity, buy_hold_shares > 0 ? 1 : 0);
+    const auto first=QDateTime::fromString(
+        QString::fromStdString(bars.front().timestamp),Qt::ISODate);
+    const auto last=QDateTime::fromString(
+        QString::fromStdString(bars.back().timestamp),Qt::ISODate);
+    constexpr double seconds_per_year=365.2425*24.0*60.0*60.0;
+    const auto elapsed_years=first.isValid() && last.isValid()
+        ? static_cast<double>(first.secsTo(last))/seconds_per_year : 0.0;
+    result.strategy = metrics(initial_cash, strategy_equity, orders, elapsed_years);
+    result.buy_and_hold = metrics(initial_cash, buy_hold_equity,
+        buy_hold_shares > 0 ? 1 : 0, elapsed_years);
     return result;
 }
 

@@ -114,16 +114,35 @@ LongCallResult run_long_call_strategy(std::span<const data::OptionObservation> o
         if(position) ++position->held;
     }
 
-    std::map<std::string,const data::Bar*> bars_by_date;
-    for(const auto& bar:underlying_bars) bars_by_date[bar.timestamp.substr(0,10)]=&bar;
+    struct SessionPrices {
+        std::string first_timestamp;
+        std::string last_timestamp;
+        double open{};
+        double close{};
+    };
+    std::map<std::string,SessionPrices> bars_by_date;
+    for(const auto& bar:underlying_bars) {
+        const auto date=bar.timestamp.substr(0,10);
+        auto [found,inserted]=bars_by_date.try_emplace(
+            date,SessionPrices{bar.timestamp,bar.timestamp,bar.open,bar.close});
+        if(!inserted && bar.timestamp<found->second.first_timestamp) {
+            found->second.first_timestamp=bar.timestamp;
+            found->second.open=bar.open;
+        }
+        if(!inserted && bar.timestamp>found->second.last_timestamp) {
+            found->second.last_timestamp=bar.timestamp;
+            found->second.close=bar.close;
+        }
+    }
     const auto first_bar=bars_by_date.lower_bound(by_date.begin()->first);
     if(first_bar==bars_by_date.end()) throw std::invalid_argument("underlying data does not overlap snapshots");
-    const auto shares=static_cast<std::int64_t>(std::floor(config.initial_cash/first_bar->second->open));
-    const double benchmark_cash=config.initial_cash-shares*first_bar->second->open;
+    const auto shares=static_cast<std::int64_t>(std::floor(config.initial_cash/first_bar->second.open));
+    const double benchmark_cash=config.initial_cash-shares*first_bar->second.open;
     for(const auto& [date,unused]:by_date) {
         (void)unused;
         const auto bar=bars_by_date.find(date);
-        if(bar!=bars_by_date.end()) result.buy_hold_equity.push_back({date,benchmark_cash+shares*bar->second->close});
+        if(bar!=bars_by_date.end())
+            result.buy_hold_equity.push_back({date,benchmark_cash+shares*bar->second.close});
     }
     if(result.buy_hold_equity.empty()) throw std::invalid_argument("no underlying closes align with snapshots");
     result.strategy=calculate_metrics(config.initial_cash,result.strategy_equity,result.trades.size()*2+(position?1:0));

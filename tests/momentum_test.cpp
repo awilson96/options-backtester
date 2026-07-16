@@ -129,8 +129,8 @@ TEST_CASE("momentum generates an executed trade ledger only when requested") {
         bars,1,1,std::nullopt,pricing,0,0,true);
     REQUIRE(normal.trades.empty());
     REQUIRE(with_ledger.trades.size()==2);
-    REQUIRE(with_ledger.trades.front().start_date=="2024-01-01");
-    REQUIRE(with_ledger.trades.front().end_date=="2024-01-02");
+    REQUIRE(with_ledger.trades.front().start_date=="2024-01-01T00:00:00.000Z");
+    REQUIRE(with_ledger.trades.front().end_date=="2024-01-02T00:00:00.000Z");
     REQUIRE(with_ledger.trades.front().start_price==10);
     REQUIRE(with_ledger.trades.front().end_price==11);
     REQUIRE(with_ledger.trades.front().result==
@@ -234,10 +234,21 @@ TEST_CASE("momentum required capital includes losses before later entries") {
     REQUIRE(result.comparisons==2);
 }
 
-TEST_CASE("momentum uses VWAP as its daily analysis price") {
+TEST_CASE("momentum uses VWAP as its bar analysis price") {
     const std::vector<options::data::Bar> bars{
         {"TEST","2024-01-01T00:00:00Z",0,0,0,10,0,0,10},
         {"TEST","2024-01-02T00:00:00Z",0,0,0,9,0,0,11},
+    };
+    const auto result=options::analysis::analyze_momentum(bars,1);
+    REQUIRE(result.wins==1);
+    REQUIRE(result.losses==0);
+}
+
+TEST_CASE("momentum preserves minute timestamps when locating the comparison bar") {
+    const std::vector<options::data::Bar> bars{
+        {"TEST","2024-01-01T14:31:00Z",0,0,0,10,0,0,10},
+        {"TEST","2024-01-02T14:30:00Z",0,0,0,9,0,0,9},
+        {"TEST","2024-01-02T14:31:00Z",0,0,0,11,0,0,11},
     };
     const auto result=options::analysis::analyze_momentum(bars,1);
     REQUIRE(result.wins==1);

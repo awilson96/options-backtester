@@ -20,7 +20,7 @@ struct BarQuery {
     std::string symbol;
     std::string provider{"alpaca"};
     std::string feed{"iex"};
-    std::string timeframe{"1Day"};
+    std::string timeframe{stock_bar_timeframe};
     std::string adjustment{"all"};
     std::string start;
     std::string end;
