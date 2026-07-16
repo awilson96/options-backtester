@@ -1339,6 +1339,7 @@ double analysis_price(const options::data::Bar& bar,const QString& field) {
     if(field=="high") return bar.high;
     if(field=="low") return bar.low;
     if(field=="close") return bar.close;
+    if(field=="average") return (bar.open+bar.close)/2.0;
     return std::isfinite(bar.vwap) && bar.vwap>0.0 ? bar.vwap : bar.close;
 }
 
@@ -1782,6 +1783,7 @@ private:
         price_field->addItem("Close","close");
         price_field->addItem("High","high");
         price_field->addItem("Low","low");
+        price_field->addItem("Average","average");
         price_field->addItem("VWAP","vwap");
         price_field->setCurrentIndex(price_field->findData("vwap"));
         auto* window_days=new QSpinBox;

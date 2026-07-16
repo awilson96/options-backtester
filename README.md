@@ -243,7 +243,8 @@ have not been run, only the study template is saved.
 Momentum defaults to VWAP as the analysis price, falling back to close only when
 VWAP is unavailable. The Momentum dialog can aggregate regular-session data into
 **1 Day**, **1 Hour**, **30 Min**, **15 Min**, **5 Min**, or **1 Min** bars and analyze
-each bar's **Open**, **Close**, **High**, **Low**, or **VWAP**. Multi-day studies
+each bar's **Open**, **Close**, **High**, **Low**, **Average**, or **VWAP**. **Average**
+is the arithmetic mean of that aggregated candle's open and close. Multi-day studies
 default to daily data and single-day studies default to one-minute data. Intraday
 buckets are anchored at 9:30 a.m. Eastern; VWAP is volume-weighted when bars are
 aggregated. These selections are saved with study presets and included in result
