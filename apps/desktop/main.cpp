@@ -11,7 +11,6 @@
 #include <QCandlestickSeries>
 #include <QCandlestickSet>
 #include <QBarCategoryAxis>
-#include <QCategoryAxis>
 #include <QCheckBox>
 #include <QColor>
 #include <QComboBox>
@@ -1364,8 +1363,9 @@ void select_analysis_price(std::span<options::data::Bar> bars,const QString& fie
 
 class TimelineChartView final : public QChartView {
 public:
-    explicit TimelineChartView(std::function<void(int)> shift_window)
-        : shift_window_(std::move(shift_window)) {
+    TimelineChartView(std::function<void(int)> shift_window,
+                      std::function<void(QDate,QDate)> zoom_range)
+        :shift_window_(std::move(shift_window)),zoom_range_(std::move(zoom_range)) {
         setMouseTracking(true);
         viewport()->setMouseTracking(true);
     }
@@ -1373,12 +1373,47 @@ public:
     void set_candles(QAbstractSeries* series,std::span<const ChartCandle> candles) {
         series_=series;
         candles_.assign(candles.begin(),candles.end());
+        if(!candles_.empty()) {
+            const auto [minimum,maximum]=price_range(0,candles_.size()-1);
+            original_price_minimum_=minimum;
+            original_price_maximum_=maximum;
+        }
         hovering_=false;
+        dragging_=false;
         viewport()->update();
     }
 
 protected:
+    void mousePressEvent(QMouseEvent* event) override {
+        if(event->button()==Qt::RightButton) {
+            chart()->zoomReset();
+            set_vertical_range(original_price_minimum_,original_price_maximum_);
+            event->accept();
+            viewport()->update();
+            return;
+        }
+        if(event->button()==Qt::LeftButton && series_ && !candles_.empty() &&
+           chart()->plotArea().contains(event->position())) {
+            dragging_=true;
+            drag_start_=event->position();
+            drag_end_=drag_start_;
+            hovering_=false;
+            event->accept();
+            viewport()->update();
+            return;
+        }
+        QChartView::mousePressEvent(event);
+    }
+
     void mouseMoveEvent(QMouseEvent* event) override {
+        if(dragging_) {
+            const auto plot=chart()->plotArea();
+            drag_end_.setX(qBound(plot.left(),event->position().x(),plot.right()));
+            drag_end_.setY(qBound(plot.top(),event->position().y(),plot.bottom()));
+            event->accept();
+            viewport()->update();
+            return;
+        }
         QChartView::mouseMoveEvent(event);
         const auto plot=chart()->plotArea();
         if(series_ && !candles_.empty() && plot.contains(event->position())) {
@@ -1390,6 +1425,40 @@ protected:
         viewport()->update();
     }
 
+    void mouseReleaseEvent(QMouseEvent* event) override {
+        if(event->button()!=Qt::LeftButton || !dragging_) {
+            QChartView::mouseReleaseEvent(event);
+            return;
+        }
+        dragging_=false;
+        const auto plot=chart()->plotArea();
+        const auto first_x=qBound(plot.left(),std::min(drag_start_.x(),drag_end_.x()),plot.right());
+        const auto last_x=qBound(plot.left(),std::max(drag_start_.x(),drag_end_.x()),plot.right());
+        viewport()->update();
+        event->accept();
+        if(last_x-first_x<8.0) return;
+        const auto first_value=chart()->mapToValue(QPointF(first_x,plot.center().y()),series_);
+        const auto last_value=chart()->mapToValue(QPointF(last_x,plot.center().y()),series_);
+        const auto index_for=[this](double value) {
+            return static_cast<std::size_t>(qBound<qint64>(0,
+                static_cast<qint64>(std::llround(value)),
+                static_cast<qint64>(candles_.size()-1)));
+        };
+        const auto first_index=index_for(first_value.x());
+        const auto last_index=index_for(last_value.x());
+        if(first_index>=last_index) return;
+        const auto first_date=candles_[first_index].timestamp.date();
+        const auto last_date=candles_[last_index].timestamp.date();
+        if(first_date==last_date) {
+            chart()->zoomIn(QRectF(first_x,plot.top(),last_x-first_x,plot.height()));
+            const auto [minimum,maximum]=price_range(first_index,last_index);
+            set_vertical_range(minimum,maximum);
+            viewport()->update();
+        } else if(zoom_range_) {
+            zoom_range_(first_date,last_date);
+        }
+    }
+
     void leaveEvent(QEvent* event) override {
         hovering_=false;
         viewport()->update();
@@ -1398,6 +1467,15 @@ protected:
 
     void paintEvent(QPaintEvent* event) override {
         QChartView::paintEvent(event);
+        if(dragging_) {
+            const auto plot=chart()->plotArea();
+            const auto first_x=qBound(plot.left(),std::min(drag_start_.x(),drag_end_.x()),plot.right());
+            const auto last_x=qBound(plot.left(),std::max(drag_start_.x(),drag_end_.x()),plot.right());
+            QPainter selection_painter(viewport());
+            selection_painter.setPen(QPen(QColor(45,115,210),1,Qt::DashLine));
+            selection_painter.setBrush(QColor(45,115,210,55));
+            selection_painter.drawRect(QRectF(first_x,plot.top(),last_x-first_x,plot.height()));
+        }
         if(!hovering_ || !series_ || candles_.empty()) return;
 
         const auto plot=chart()->plotArea();
@@ -1469,11 +1547,37 @@ protected:
     }
 
 private:
+    std::pair<double,double> price_range(std::size_t first,std::size_t last) const {
+        auto minimum=std::numeric_limits<double>::max();
+        auto maximum=std::numeric_limits<double>::lowest();
+        for(auto index=first;index<=last;++index) {
+            minimum=std::min(minimum,candles_[index].low);
+            maximum=std::max(maximum,candles_[index].high);
+        }
+        const auto spread=maximum-minimum;
+        const auto padding=spread>0.0 ? spread*.05 : std::max(1.0,std::abs(minimum)*.01);
+        return {minimum-padding,maximum+padding};
+    }
+
+    void set_vertical_range(double minimum,double maximum) {
+        if(!series_ || !std::isfinite(minimum) || !std::isfinite(maximum) || minimum>=maximum)
+            return;
+        const auto axes=chart()->axes(Qt::Vertical,series_);
+        for(auto* axis:axes)
+            if(auto* values=qobject_cast<QValueAxis*>(axis)) values->setRange(minimum,maximum);
+    }
+
     std::function<void(int)> shift_window_;
+    std::function<void(QDate,QDate)> zoom_range_;
     std::vector<ChartCandle> candles_;
     QAbstractSeries* series_{};
     QPointF hover_position_;
+    QPointF drag_start_;
+    QPointF drag_end_;
     bool hovering_{};
+    bool dragging_{};
+    double original_price_minimum_{};
+    double original_price_maximum_{};
     int pending_direction_{};
     int pending_events_{};
 };
@@ -1776,7 +1880,9 @@ public:
         saved_studies_row->addWidget(delete_study_button_);
         saved_studies_row->addStretch();
         stock_layout->addLayout(saved_studies_row);
-        stock_chart_view_=new TimelineChartView([this](int direction){ shift_date_window(direction); });
+        stock_chart_view_=new TimelineChartView(
+            [this](int direction){ shift_date_window(direction); },
+            [this](const QDate& start,const QDate& end){ zoom_date_window(start,end); });
         stock_chart_view_->setRenderHint(QPainter::Antialiasing);
         stock_layout->addWidget(stock_chart_view_,1);
         tabs->addTab(stock_page,"Underlying Price");
@@ -1808,7 +1914,10 @@ public:
         setCentralWidget(central);
 
         connect(open_button,&QPushButton::clicked,this,[this]{ choose_database(); });
-        connect(stock_symbol_,&QComboBox::currentTextChanged,this,[this]{ update_stock_range(); });
+        connect(stock_symbol_,&QComboBox::currentTextChanged,this,[this] {
+            persist_underlying_selection();
+            update_stock_range();
+        });
         const auto dates_changed=[this] {
             persist_dates();
             if(!candle_interval_overridden_) select_default_candle_interval();
@@ -1818,6 +1927,7 @@ public:
         connect(stock_end_,&QDateEdit::dateChanged,this,dates_changed);
         connect(candle_interval_,&QComboBox::activated,this,[this](int) {
             candle_interval_overridden_=true;
+            persist_underlying_selection();
             plot_underlying();
         });
         connect(strategy_,&QComboBox::activated,this,[this](int index){
@@ -1874,6 +1984,7 @@ private:
         auto selected_end=last;
         QSettings settings("OptionsBacktester","OptionsBacktester");
         settings.beginGroup("underlying_price");
+        const auto saved_interval=settings.value("candle_resolution_minutes");
         settings.beginGroup(stock_symbol_->currentText());
         const auto saved_start=QDate::fromString(settings.value("start_date").toString(),Qt::ISODate);
         const auto saved_end=QDate::fromString(settings.value("end_date").toString(),Qt::ISODate);
@@ -1884,8 +1995,16 @@ private:
             selected_end=last;
         }
         stock_start_->setDate(selected_start); stock_end_->setDate(selected_end);
-        candle_interval_overridden_=false;
-        select_default_candle_interval();
+        const auto saved_interval_index=saved_interval.isValid()
+            ? candle_interval_->findData(saved_interval.toInt()) : -1;
+        if(saved_interval_index>=0) {
+            const QSignalBlocker interval_blocker(candle_interval_);
+            candle_interval_->setCurrentIndex(saved_interval_index);
+            candle_interval_overridden_=true;
+        } else {
+            candle_interval_overridden_=false;
+            select_default_candle_interval();
+        }
         plot_underlying();
     }
 
@@ -1898,17 +2017,22 @@ private:
     void load_stock_symbols() {
         if(!bar_store_) return;
         const auto previous=stock_symbol_->currentText();
+        QSettings settings("OptionsBacktester","OptionsBacktester");
+        settings.beginGroup("underlying_price");
+        const auto saved_symbol=settings.value("symbol").toString();
         stock_symbol_->blockSignals(true); stock_symbol_->clear();
         for(const auto& symbol:bar_store_->available_symbols(
                 "alpaca","iex",options::data::stock_bar_timeframe,"all"))
             stock_symbol_->addItem(QString::fromStdString(symbol));
-        const auto previous_index=stock_symbol_->findText(previous);
-        if(previous_index>=0) stock_symbol_->setCurrentIndex(previous_index);
+        const auto preferred_symbol=previous.isEmpty() ? saved_symbol : previous;
+        const auto preferred_index=stock_symbol_->findText(preferred_symbol);
+        if(preferred_index>=0) stock_symbol_->setCurrentIndex(preferred_index);
         stock_symbol_->blockSignals(false);
         if(stock_symbol_->count()==0) {
             return;
         }
         update_stock_range();
+        persist_underlying_selection();
     }
 
     void shift_date_window(int direction) {
@@ -1930,6 +2054,20 @@ private:
         plot_underlying();
     }
 
+    void zoom_date_window(const QDate& requested_start,const QDate& requested_end) {
+        if(!available_start_.isValid() || !available_end_.isValid()) return;
+        const auto start=qBound(available_start_,std::min(requested_start,requested_end),available_end_);
+        const auto end=qBound(available_start_,std::max(requested_start,requested_end),available_end_);
+        if(start>end) return;
+        const QSignalBlocker block_start(stock_start_);
+        const QSignalBlocker block_end(stock_end_);
+        stock_start_->setDate(start);
+        stock_end_->setDate(end);
+        persist_dates();
+        if(!candle_interval_overridden_) select_default_candle_interval();
+        plot_underlying();
+    }
+
     void persist_dates() const {
         if(stock_symbol_->currentText().isEmpty()) return;
         QSettings settings("OptionsBacktester","OptionsBacktester");
@@ -1937,6 +2075,14 @@ private:
         settings.beginGroup(stock_symbol_->currentText());
         settings.setValue("start_date",stock_start_->date().toString(Qt::ISODate));
         settings.setValue("end_date",stock_end_->date().toString(Qt::ISODate));
+    }
+
+    void persist_underlying_selection() const {
+        if(stock_symbol_->currentText().isEmpty()) return;
+        QSettings settings("OptionsBacktester","OptionsBacktester");
+        settings.beginGroup("underlying_price");
+        settings.setValue("symbol",stock_symbol_->currentText());
+        settings.setValue("candle_resolution_minutes",candle_interval_->currentData().toInt());
     }
 
     void refresh_saved_studies(const QString& preferred_id={}) {
@@ -3517,28 +3663,11 @@ private:
                 position_categories.push_back(QString::number(index));
             candle_positions->append(position_categories);
             candle_positions->setVisible(false);
-            auto* dates=new QCategoryAxis;
-            dates->setTitleText("Market time (ET; closed periods omitted)");
-            dates->setLabelsPosition(QCategoryAxis::AxisLabelsPositionOnValue);
-            dates->setStartValue(-0.5);
-            dates->setRange(-0.5,static_cast<qreal>(chart_candles.size())-0.5);
-            const auto label_step=std::max<std::size_t>(1,(chart_candles.size()+7)/8);
-            const auto label_format=resolution.minutes==0
-                ? QString("MMM d yyyy")
-                : chart_candles.front().timestamp.date()==chart_candles.back().timestamp.date()
-                    ? QString("HH:mm") : QString("MMM d HH:mm");
-            for(std::size_t index=0;index<chart_candles.size();index+=label_step)
-                dates->append(chart_candles[index].timestamp.toString(label_format),
-                    static_cast<qreal>(index));
-            if((chart_candles.size()-1)%label_step!=0)
-                dates->append(chart_candles.back().timestamp.toString(label_format),
-                    static_cast<qreal>(chart_candles.size()-1));
             auto* values=new QValueAxis; values->setLabelFormat("$%.2f"); values->setTitleText("Price");
             const auto spread=price_max-price_min;
             const auto padding=spread>0.0 ? spread*0.05 : qMax(1.0,std::abs(price_min)*0.01);
             values->setRange(price_min-padding,price_max+padding);
             chart->addAxis(candle_positions,Qt::AlignBottom);
-            chart->addAxis(dates,Qt::AlignBottom);
             chart->addAxis(values,Qt::AlignLeft);
             candles->attachAxis(candle_positions);
             candles->attachAxis(values);

@@ -189,7 +189,8 @@ the selected date window left or right along the available timeline. Every five
 consecutive scroll events in one direction moves it by one step.
 Hovering over the underlying chart snaps a dashed vertical guide to the nearest
 displayed candle and shows its timestamp, OHLC, and volume in a box to the
-left of the guide. Timestamps use the `America/New_York` time zone, including the
+left of the guide. The redundant horizontal-axis time labels are hidden because the
+hover box provides the precise timestamp. Timestamps use the `America/New_York` time zone, including the
 EST/EDT daylight-saving transition. Only regular market hours from 9:30 a.m. up
 to 4:00 p.m. Eastern are plotted. Closed and missing periods are removed from the
 horizontal scale, so one session's final candle is followed immediately by the
@@ -199,7 +200,19 @@ below open. A single-day view defaults to **1 Min** candles; any multi-day view
 defaults to **1 Day** candles. The **Candles** dropdown at the top right can
 override that default with **1 Day**, **1 Hour**, **30 Min**, **15 Min**, **5 Min**,
 or **1 Min**. Intraday buckets are anchored at the 9:30 a.m. open, so the final
-1-hour candle contains the last 30 minutes of the regular session.
+1-hour candle contains the last 30 minutes of the regular session. The selected
+symbol and candle resolution persist between application runs. Start and end dates
+are persisted separately for each symbol and restored within that symbol's available
+stored-data range.
+
+Click and drag horizontally across the underlying chart to display a translucent
+selection and zoom when the mouse is released. A selection spanning multiple dates
+updates and persists the page's start/end dates before rebuilding the chart. A
+selection within one trading day zooms the existing chart directly so intraday
+ranges are retained. Its vertical price axis is recalculated from the selected
+candles so their minimum and maximum fill the chart height with a small margin.
+Drags narrower than eight pixels are treated as ordinary clicks, and right-clicking
+resets both axes to the complete chart range.
 
 ### Intraday distribution study foundation
 
