@@ -174,6 +174,10 @@ commissions, assignment, exercise, or rolling.
 
 ## Qt results viewer
 
+Mouse-wheel scrolling is disabled on all combo boxes so scrolling a page or dialog
+cannot accidentally change a dropdown value. Dropdowns continue to work through
+normal click and keyboard selection.
+
 Launch the native Qt viewer without command-line options:
 
 ```bash
@@ -244,6 +248,12 @@ display actual low/high occurrences or any 50%, 40%, 30%, 20%, or 10% downside o
 upside membership distribution. Selecting a histogram on any weekday page updates
 the selector and histogram on every other weekday page, making direct day-to-day
 comparisons possible without repeating the selection five times.
+
+Hovering over a histogram snaps a dashed vertical guide to the nearest one-minute
+bin. A summary box to the left reports the exact Eastern one-minute interval, its
+occurrence count, its percentage of all observations in that histogram, and the
+histogram's peak count. This inspection remains available while a ledger row's
+contribution is highlighted in orange.
 
 The ledger reports each session's daily OHLC, median, actual low/high occurrence
 times, and selected quantile membership size and segment count. Hovering a ledger

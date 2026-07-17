@@ -82,6 +82,17 @@
 
 namespace {
 
+class ComboBoxWheelFilter final : public QObject {
+protected:
+    bool eventFilter(QObject* watched,QEvent* event) override {
+        if(event->type()==QEvent::Wheel && qobject_cast<QComboBox*>(watched)) {
+            event->accept();
+            return true;
+        }
+        return QObject::eventFilter(watched,event);
+    }
+};
+
 struct LoadResult {
     QString symbol;
     QString database_path;
@@ -1587,6 +1598,7 @@ public:
     explicit IntradayHistogramWidget(QWidget* parent=nullptr):QWidget(parent) {
         setMinimumHeight(230);
         setSizePolicy(QSizePolicy::Expanding,QSizePolicy::Expanding);
+        setMouseTracking(true);
     }
 
     void set_histogram(const options::analysis::IntradayMinuteHistogram& histogram,
@@ -1604,6 +1616,32 @@ public:
     }
 
 protected:
+    void mouseMoveEvent(QMouseEvent* event) override {
+        constexpr int left=55;
+        constexpr int right=18;
+        constexpr int top=34;
+        constexpr int bottom=34;
+        const QRectF plot(left,top,std::max(1,width()-left-right),
+            std::max(1,height()-top-bottom));
+        if(plot.contains(event->position())) {
+            const auto fraction=(event->position().x()-plot.left())/plot.width();
+            hover_minute_=qBound(0,static_cast<int>(
+                std::floor(fraction*options::analysis::intraday_regular_session_minutes)),
+                options::analysis::intraday_regular_session_minutes-1);
+            hovering_=true;
+        } else {
+            hovering_=false;
+        }
+        update();
+        QWidget::mouseMoveEvent(event);
+    }
+
+    void leaveEvent(QEvent* event) override {
+        hovering_=false;
+        update();
+        QWidget::leaveEvent(event);
+    }
+
     void paintEvent(QPaintEvent*) override {
         QPainter painter(this);
         painter.setRenderHint(QPainter::Antialiasing,false);
@@ -1653,6 +1691,44 @@ protected:
         painter.drawText(QRectF(2,plot.top()-8,left-8,18),Qt::AlignRight,
             QString::number(histogram_.peak_count));
         painter.drawText(QRectF(2,plot.bottom()-9,left-8,18),Qt::AlignRight,"0");
+        if(hovering_) {
+            const auto bin_width=plot.width()/options::analysis::intraday_regular_session_minutes;
+            const auto guide_x=plot.left()+(hover_minute_+.5)*bin_width;
+            painter.setPen(QPen(QColor("#777777"),1,Qt::DashLine));
+            painter.drawLine(QPointF(guide_x,plot.top()),QPointF(guide_x,plot.bottom()));
+            const auto start_time=QTime(9,30).addSecs(hover_minute_*60);
+            const auto end_time=start_time.addSecs(60);
+            const auto count=histogram_.counts[static_cast<std::size_t>(hover_minute_)];
+            const auto share=histogram_.total_occurrences==0 ? 0.0
+                : 100.0*count/histogram_.total_occurrences;
+            const QStringList lines{
+                "Time (ET): "+start_time.toString("h:mm AP")+"–"+
+                    end_time.toString("h:mm AP"),
+                "Count: "+QString::number(count),
+                "Share: "+QString::number(share,'f',2)+"%",
+                "Peak count: "+QString::number(histogram_.peak_count),
+            };
+            const QFontMetrics metrics(painter.font());
+            int text_width=0;
+            for(const auto& line:lines)
+                text_width=std::max(text_width,metrics.horizontalAdvance(line));
+            constexpr int horizontal_padding=10;
+            constexpr int vertical_padding=7;
+            const auto box_width=text_width+horizontal_padding*2;
+            const auto box_height=metrics.height()*lines.size()+vertical_padding*2;
+            const auto box_x=std::max(6.0,guide_x-box_width-10.0);
+            const auto box_y=plot.top()+8.0;
+            const QRectF box(box_x,box_y,box_width,box_height);
+            painter.setPen(QPen(QColor("#a8a8a8")));
+            painter.setBrush(QColor("#e8e8e8"));
+            painter.drawRoundedRect(box,5,5);
+            painter.setPen(QColor("#202020"));
+            auto baseline=box.top()+vertical_padding+metrics.ascent();
+            for(const auto& line:lines) {
+                painter.drawText(QPointF(box.left()+horizontal_padding,baseline),line);
+                baseline+=metrics.height();
+            }
+        }
     }
 
 private:
@@ -1660,6 +1736,8 @@ private:
     QString title_;
     QColor color_{70,130,180};
     std::vector<int> highlighted_minutes_;
+    int hover_minute_{};
+    bool hovering_{};
 };
 
 const std::array<QColor,5>& intraday_level_colors() {
@@ -3699,6 +3777,8 @@ private:
 
 int main(int argc,char** argv) {
     QApplication app(argc,argv);
+    ComboBoxWheelFilter combo_box_wheel_filter;
+    app.installEventFilter(&combo_box_wheel_filter);
     ResultsWindow window;
     window.show();
     return app.exec();
