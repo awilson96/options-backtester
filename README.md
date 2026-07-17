@@ -201,6 +201,41 @@ override that default with **1 Day**, **1 Hour**, **30 Min**, **15 Min**, **5 Mi
 or **1 Min**. Intraday buckets are anchored at the 9:30 a.m. open, so the final
 1-hour candle contains the last 30 minutes of the regular session.
 
+### Intraday distribution study foundation
+
+The replacement intraday study calculation always uses one-minute regular-session
+candles. A session is accepted only when it contains one unique candle for every
+minute from 9:30 a.m. through 3:59 p.m. Eastern; incomplete, short, invalid, and
+duplicate-minute sessions are excluded and counted.
+
+Each accepted session stores its 390 one-minute candles, using `(open + close) / 2`
+as the candle-count-weighted analysis price. The calculation independently derives
+the lowest and highest **50%**, **40%**, **30%**, **20%**, and **10%** of candles for
+that session. Quantile-boundary ties are retained even when this makes a membership
+slightly larger than its target. Each membership preserves both its individual
+minute offsets and its piecewise contiguous time ranges. Actual session-low and
+session-high occurrence minutes are recorded separately from the quantile sets.
+
+The accepted sessions are aggregated independently into Monday-through-Friday
+records. Every weekday record contains 390-bin, one-minute-resolution histograms for
+actual low occurrences, actual high occurrences, and each downside and upside
+quantile membership. Histogram bins store occurrence counts, and the aggregation
+also records total observations, the peak count, and every tied peak minute. Tied
+daily lows and highs increment every minute where that extreme occurred.
+
+Choose **Intraday Distribution** from the strategy dropdown to open its dedicated
+strategy window. The Monday-through-Friday tabs live inside that window rather than
+beside the application's top-level **Underlying Price** tab. Each weekday page shows
+a selectable 390-bin histogram above its session ledger. The histogram selector can
+display actual low/high occurrences or any 50%, 40%, 30%, 20%, or 10% downside or
+upside membership distribution.
+
+The ledger reports each session's daily OHLC, median, actual low/high occurrence
+times, and selected quantile membership size and segment count. Hovering a ledger
+row overlays that session's contributing minutes in orange on the currently selected
+aggregate histogram. The detailed day charts and weekly ranking summary will be
+layered on this interface in subsequent implementation steps.
+
 Choose **Momentum** from the chart's strategy dropdown to open its analysis
 dialog. By default it evaluates a 30-day rolling window over the latest year
 of stored data. For each bar q, r is the first stored bar at or after q's exact

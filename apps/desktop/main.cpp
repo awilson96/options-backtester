@@ -1,4 +1,5 @@
 #include "options/analysis/momentum.hpp"
+#include "options/analysis/intraday_distribution.hpp"
 #include "options/data/sqlite_bar_store.hpp"
 #include "options/providers/alpaca/alpaca_client.hpp"
 
@@ -86,6 +87,11 @@ struct LoadResult {
     QString database_path;
     std::size_t downloaded{};
     bool cached{};
+    QString error;
+};
+
+struct IntradayDistributionOutput {
+    options::analysis::IntradayDistributionResult result;
     QString error;
 };
 
@@ -1463,6 +1469,99 @@ private:
     int pending_events_{};
 };
 
+class IntradayHistogramWidget final : public QWidget {
+public:
+    explicit IntradayHistogramWidget(QWidget* parent=nullptr):QWidget(parent) {
+        setMinimumHeight(230);
+        setSizePolicy(QSizePolicy::Expanding,QSizePolicy::Expanding);
+    }
+
+    void set_histogram(const options::analysis::IntradayMinuteHistogram& histogram,
+                       QString title,QColor color) {
+        histogram_=histogram;
+        title_=std::move(title);
+        color_=color;
+        highlighted_minutes_.clear();
+        update();
+    }
+
+    void set_highlighted_minutes(std::vector<int> minutes) {
+        highlighted_minutes_=std::move(minutes);
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing,false);
+        painter.fillRect(rect(),palette().base());
+        constexpr int left=55;
+        constexpr int right=18;
+        constexpr int top=34;
+        constexpr int bottom=34;
+        const QRectF plot(left,top,std::max(1,width()-left-right),
+            std::max(1,height()-top-bottom));
+        painter.setPen(palette().text().color());
+        painter.drawText(QRectF(left,5,plot.width(),22),Qt::AlignLeft|Qt::AlignVCenter,
+            title_+"  ("+QString::number(histogram_.total_occurrences)+" observations)");
+        painter.setPen(QColor(135,135,135));
+        painter.drawLine(plot.bottomLeft(),plot.bottomRight());
+        painter.drawLine(plot.bottomLeft(),plot.topLeft());
+        if(histogram_.peak_count>0) {
+            const auto bin_width=plot.width()/options::analysis::intraday_regular_session_minutes;
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(color_);
+            for(int minute=0;minute<options::analysis::intraday_regular_session_minutes;++minute) {
+                const auto count=histogram_.counts[static_cast<std::size_t>(minute)];
+                if(count==0) continue;
+                const auto height=plot.height()*static_cast<double>(count)/histogram_.peak_count;
+                painter.drawRect(QRectF(plot.left()+minute*bin_width,plot.bottom()-height,
+                    std::max(1.0,bin_width),height));
+            }
+            painter.setBrush(QColor(255,140,0));
+            for(const auto minute:highlighted_minutes_) {
+                if(minute<0 || minute>=options::analysis::intraday_regular_session_minutes) continue;
+                const auto count=histogram_.counts[static_cast<std::size_t>(minute)];
+                const auto height=count==0 ? plot.height()*.04
+                    : plot.height()*static_cast<double>(count)/histogram_.peak_count;
+                painter.drawRect(QRectF(plot.left()+minute*bin_width,plot.bottom()-height,
+                    std::max(2.0,bin_width),height));
+            }
+        }
+        painter.setPen(palette().text().color());
+        const std::array<std::pair<int,const char*>,6> ticks{{
+            {0,"9:30"},{90,"11:00"},{180,"12:30"},{270,"2:00"},{360,"3:30"},{390,"4:00"}}};
+        for(const auto& [minute,label]:ticks) {
+            const auto x=plot.left()+plot.width()*minute/
+                options::analysis::intraday_regular_session_minutes;
+            painter.drawLine(QPointF(x,plot.bottom()),QPointF(x,plot.bottom()+4));
+            painter.drawText(QRectF(x-24,plot.bottom()+6,48,18),Qt::AlignHCenter,label);
+        }
+        painter.drawText(QRectF(2,plot.top()-8,left-8,18),Qt::AlignRight,
+            QString::number(histogram_.peak_count));
+        painter.drawText(QRectF(2,plot.bottom()-9,left-8,18),Qt::AlignRight,"0");
+    }
+
+private:
+    options::analysis::IntradayMinuteHistogram histogram_;
+    QString title_;
+    QColor color_{70,130,180};
+    std::vector<int> highlighted_minutes_;
+};
+
+class IntradayLedgerTable final : public QTableWidget {
+public:
+    using QTableWidget::QTableWidget;
+    std::function<void()> mouse_left;
+
+protected:
+    void leaveEvent(QEvent* event) override {
+        QTableWidget::leaveEvent(event);
+        clearSelection();
+        if(mouse_left) mouse_left();
+    }
+};
+
 class ResultsWindow final : public QMainWindow {
 public:
     ResultsWindow() {
@@ -1478,7 +1577,7 @@ public:
         auto* stock_controls=new QHBoxLayout;
         stock_symbol_=new QComboBox;
         strategy_=new QComboBox;
-        strategy_->addItems({"Select strategy…","Momentum"});
+        strategy_->addItems({"Select strategy…","Momentum","Intraday Distribution"});
         candle_interval_=new QComboBox;
         candle_interval_->addItem("1 Day",0);
         candle_interval_->addItem("1 Hour",60);
@@ -1554,6 +1653,7 @@ public:
         });
         connect(strategy_,&QComboBox::activated,this,[this](int index){
             if(index==1) show_momentum_analysis();
+            else if(index==2) show_intraday_distribution_analysis();
             strategy_->setCurrentIndex(0);
         });
         connect(load_button_,&QPushButton::clicked,this,[this]{ load_symbol_data(); });
@@ -1733,6 +1833,250 @@ private:
             return;
         delete_study_preset(id);
         refresh_saved_studies();
+    }
+
+
+    void show_intraday_distribution_analysis() {
+        const auto symbol=stock_symbol_->currentText();
+        if(symbol.isEmpty() || !available_start_.isValid() || !available_end_.isValid()) {
+            QMessageBox::information(this,"Intraday Distribution",
+                "Select a symbol with stored one-minute bars first.");
+            return;
+        }
+
+        QDialog dialog(this);
+        dialog.setWindowTitle("Intraday Distribution — "+symbol);
+        dialog.setWindowFlag(Qt::WindowMaximizeButtonHint,true);
+        dialog.setSizeGripEnabled(true);
+        dialog.setMinimumSize(1050,720);
+        const auto available_size=dialog.screen()->availableGeometry().size();
+        dialog.resize(qMin(1450,available_size.width()-40),
+            qMin(900,available_size.height()-40));
+        auto* layout=new QVBoxLayout(&dialog);
+        auto* description=new QLabel(
+            "The strategy always analyzes complete 390-candle regular sessions at one-minute "
+            "resolution. Its Monday–Friday pages are contained inside this strategy window. "
+            "Hover a ledger row to highlight that session's contribution to the selected histogram.");
+        description->setWordWrap(true);
+        layout->addWidget(description);
+
+        auto* controls=new QHBoxLayout;
+        auto* ticker=new QComboBox;
+        for(int index=0;index<stock_symbol_->count();++index)
+            ticker->addItem(stock_symbol_->itemText(index));
+        ticker->setCurrentText(symbol);
+        auto* start=new QDateEdit(qMax(available_start_,available_end_.addYears(-1)));
+        auto* end=new QDateEdit(available_end_);
+        start->setCalendarPopup(true);
+        end->setCalendarPopup(true);
+        start->setDateRange(available_start_,available_end_);
+        end->setDateRange(available_start_,available_end_);
+        auto* run=new QPushButton("Run Study");
+        controls->addWidget(new QLabel("Ticker:"));
+        controls->addWidget(ticker);
+        controls->addWidget(new QLabel("Start:"));
+        controls->addWidget(start);
+        controls->addWidget(new QLabel("End:"));
+        controls->addWidget(end);
+        controls->addWidget(run);
+        controls->addStretch();
+        layout->addLayout(controls);
+
+        auto* weekday_tabs=new QTabWidget;
+        layout->addWidget(weekday_tabs,1);
+        auto* status=new QLabel;
+        status->setWordWrap(true);
+        layout->addWidget(status);
+
+        auto* watcher=new QFutureWatcher<IntradayDistributionOutput>(&dialog);
+        const auto minute_text=[](int minute) {
+            return QTime(9,30).addSecs(minute*60).toString("h:mm AP");
+        };
+        const auto minute_list_text=[minute_text](const std::vector<int>& minutes) {
+            QStringList values;
+            for(const auto minute:minutes) values.push_back(minute_text(minute));
+            return values.join(", ");
+        };
+        const auto membership_text=[](const options::analysis::IntradayQuantileMembership& value) {
+            return QString::number(value.minutes.size())+" min / "+
+                QString::number(value.ranges.size())+" segment(s)";
+        };
+        const auto number_item=[](double value) {
+            auto* item=new QTableWidgetItem(QString::number(value,'f',2));
+            item->setData(Qt::UserRole,value);
+            return item;
+        };
+
+        connect(watcher,&QFutureWatcher<IntradayDistributionOutput>::finished,&dialog,[&] {
+            run->setEnabled(true);
+            ticker->setEnabled(true);
+            start->setEnabled(true);
+            end->setEnabled(true);
+            auto output=watcher->result();
+            if(!output.error.isEmpty()) {
+                status->setText("Study failed: "+output.error);
+                return;
+            }
+            while(weekday_tabs->count()>0) delete weekday_tabs->widget(0);
+            auto analysis=std::make_shared<options::analysis::IntradayDistributionResult>(
+                std::move(output.result));
+            auto weekdays=std::make_shared<std::array<
+                options::analysis::IntradayWeekdayAggregation,5>>(
+                options::analysis::aggregate_intraday_weekdays(analysis->sessions));
+            static const QStringList weekday_names{
+                "Monday","Tuesday","Wednesday","Thursday","Friday"};
+
+            for(int weekday_index=0;weekday_index<5;++weekday_index) {
+                auto* page=new QWidget;
+                auto* page_layout=new QVBoxLayout(page);
+                auto* histogram_controls=new QHBoxLayout;
+                auto* histogram_choice=new QComboBox;
+                histogram_choice->addItems({"Actual low occurrences","Actual high occurrences",
+                    "Downside 50%","Downside 40%","Downside 30%","Downside 20%",
+                    "Downside 10%","Upside 50%","Upside 40%","Upside 30%",
+                    "Upside 20%","Upside 10%"});
+                histogram_controls->addWidget(new QLabel("Histogram:"));
+                histogram_controls->addWidget(histogram_choice);
+                histogram_controls->addStretch();
+                histogram_controls->addWidget(new QLabel(
+                    "Orange bars show the hovered ledger session."));
+                page_layout->addLayout(histogram_controls);
+                auto* histogram=new IntradayHistogramWidget;
+                page_layout->addWidget(histogram,1);
+
+                auto* ledger=new IntradayLedgerTable;
+                ledger->setColumnCount(12);
+                ledger->setHorizontalHeaderLabels({"Date","Open","High","Low","Close",
+                    "Median","Low time(s)","High time(s)","Down 50%","Down 10%",
+                    "Up 50%","Up 10%"});
+                ledger->setAlternatingRowColors(true);
+                ledger->setEditTriggers(QAbstractItemView::NoEditTriggers);
+                ledger->setSelectionBehavior(QAbstractItemView::SelectRows);
+                ledger->setMouseTracking(true);
+                ledger->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+                ledger->horizontalHeader()->setStretchLastSection(true);
+                std::vector<std::size_t> session_indices;
+                for(std::size_t index=0;index<analysis->sessions.size();++index)
+                    if(analysis->sessions[index].weekday==weekday_index+1)
+                        session_indices.push_back(index);
+                ledger->setRowCount(static_cast<int>(session_indices.size()));
+                for(int row=0;row<ledger->rowCount();++row) {
+                    const auto& session=analysis->sessions[session_indices[static_cast<std::size_t>(row)]];
+                    ledger->setItem(row,0,new QTableWidgetItem(QString::fromStdString(session.date)));
+                    ledger->setItem(row,1,number_item(session.minutes.front().open));
+                    ledger->setItem(row,2,number_item(session.session_high));
+                    ledger->setItem(row,3,number_item(session.session_low));
+                    ledger->setItem(row,4,number_item(session.minutes.back().close));
+                    ledger->setItem(row,5,number_item(session.downside[0].price_threshold));
+                    ledger->setItem(row,6,new QTableWidgetItem(minute_list_text(session.low_minutes)));
+                    ledger->setItem(row,7,new QTableWidgetItem(minute_list_text(session.high_minutes)));
+                    ledger->setItem(row,8,new QTableWidgetItem(membership_text(session.downside[0])));
+                    ledger->setItem(row,9,new QTableWidgetItem(membership_text(session.downside[4])));
+                    ledger->setItem(row,10,new QTableWidgetItem(membership_text(session.upside[0])));
+                    ledger->setItem(row,11,new QTableWidgetItem(membership_text(session.upside[4])));
+                }
+                page_layout->addWidget(ledger,2);
+
+                const auto select_histogram=[histogram,histogram_choice,weekdays,weekday_index] {
+                    const auto& weekday=(*weekdays)[static_cast<std::size_t>(weekday_index)];
+                    const auto selection=histogram_choice->currentIndex();
+                    if(selection==0)
+                        histogram->set_histogram(weekday.lows,"Actual daily-low occurrences",
+                            QColor(50,125,200));
+                    else if(selection==1)
+                        histogram->set_histogram(weekday.highs,"Actual daily-high occurrences",
+                            QColor(185,80,115));
+                    else if(selection<=6) {
+                        const auto level=static_cast<std::size_t>(selection-2);
+                        histogram->set_histogram(weekday.downside[level],
+                            "Lowest "+QString::number(weekday.downside[level].percentage)+
+                            "% candle membership",QColor(55,145,135));
+                    } else {
+                        const auto level=static_cast<std::size_t>(selection-7);
+                        histogram->set_histogram(weekday.upside[level],
+                            "Highest "+QString::number(weekday.upside[level].percentage)+
+                            "% candle membership",QColor(145,90,180));
+                    }
+                };
+                connect(histogram_choice,&QComboBox::currentIndexChanged,page,
+                    [select_histogram](int){ select_histogram(); });
+                select_histogram();
+
+                connect(ledger,&QTableWidget::cellEntered,page,
+                    [histogram,histogram_choice,analysis,session_indices,ledger](int row,int) {
+                    if(row<0 || static_cast<std::size_t>(row)>=session_indices.size()) return;
+                    ledger->selectRow(row);
+                    const auto& session=analysis->sessions[
+                        session_indices[static_cast<std::size_t>(row)]];
+                    const auto selection=histogram_choice->currentIndex();
+                    if(selection==0) histogram->set_highlighted_minutes(session.low_minutes);
+                    else if(selection==1) histogram->set_highlighted_minutes(session.high_minutes);
+                    else if(selection<=6) histogram->set_highlighted_minutes(
+                        session.downside[static_cast<std::size_t>(selection-2)].minutes);
+                    else histogram->set_highlighted_minutes(
+                        session.upside[static_cast<std::size_t>(selection-7)].minutes);
+                });
+                ledger->mouse_left=[histogram] { histogram->set_highlighted_minutes({}); };
+                weekday_tabs->addTab(page,weekday_names[weekday_index]+" ("+
+                    QString::number(session_indices.size())+")");
+            }
+            status->setText("Accepted "+QString::number(analysis->sessions.size())+" of "+
+                QString::number(analysis->candidate_sessions)+" candidate sessions. Excluded "+
+                QString::number(analysis->excluded_incomplete_sessions)+
+                " incomplete/short and "+QString::number(analysis->excluded_invalid_sessions)+
+                " invalid/duplicate sessions.");
+        });
+
+        const auto update_range=[&](const QString& selected_symbol) {
+            const auto range=bar_store_->date_range({selected_symbol.toStdString(),"alpaca",
+                "iex",options::data::stock_bar_timeframe,"all","",""});
+            const auto first=QDate::fromString(QString::fromStdString(range.start),Qt::ISODate);
+            const auto last=QDate::fromString(QString::fromStdString(range.end),Qt::ISODate);
+            if(!first.isValid() || !last.isValid()) return;
+            const QSignalBlocker start_blocker(start);
+            const QSignalBlocker end_blocker(end);
+            start->setDateRange(first,last);
+            end->setDateRange(first,last);
+            start->setDate(qMax(first,last.addYears(-1)));
+            end->setDate(last);
+            dialog.setWindowTitle("Intraday Distribution — "+selected_symbol);
+        };
+        connect(ticker,&QComboBox::currentTextChanged,&dialog,update_range);
+
+        const auto run_study=[&] {
+            if(watcher->isRunning()) return;
+            if(start->date()>end->date()) {
+                status->setText("The start date must not be after the end date.");
+                return;
+            }
+            run->setEnabled(false);
+            ticker->setEnabled(false);
+            start->setEnabled(false);
+            end->setEnabled(false);
+            while(weekday_tabs->count()>0) delete weekday_tabs->widget(0);
+            status->setText("Building one-minute session records and weekday histograms…");
+            const auto database_path=database_path_;
+            const auto selected_symbol=ticker->currentText();
+            const auto start_text=start->date().toString(Qt::ISODate);
+            const auto end_text=end->date().toString(Qt::ISODate);
+            watcher->setFuture(QtConcurrent::run(
+                [database_path,selected_symbol,start_text,end_text] {
+                    IntradayDistributionOutput output;
+                    try {
+                        options::data::SqliteBarStore store(database_path.toStdString());
+                        const auto bars=store.load({selected_symbol.toStdString(),"alpaca","iex",
+                            options::data::stock_bar_timeframe,"all",start_text.toStdString(),
+                            end_text.toStdString()});
+                        output.result=options::analysis::analyze_intraday_distribution(bars);
+                    } catch(const std::exception& error) {
+                        output.error=QString::fromUtf8(error.what());
+                    }
+                    return output;
+                }));
+        };
+        connect(run,&QPushButton::clicked,&dialog,run_study);
+        run_study();
+        dialog.exec();
     }
 
     void show_momentum_analysis(std::optional<MomentumStudyPreset> preset=std::nullopt) {

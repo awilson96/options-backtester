@@ -42,6 +42,7 @@ target_compile_options(options_backtest PRIVATE
 )
 
 add_library(options_analysis
+    src/analysis/intraday_distribution.cpp
     src/analysis/momentum.cpp
 )
 target_include_directories(options_analysis PUBLIC include)
@@ -63,6 +64,7 @@ if(BUILD_TESTING)
         tests/alpaca_json_test.cpp
         tests/bar_validation_test.cpp
         tests/equity_backtest_test.cpp
+        tests/intraday_distribution_test.cpp
         tests/long_call_backtest_test.cpp
         tests/momentum_test.cpp
         tests/option_json_test.cpp
