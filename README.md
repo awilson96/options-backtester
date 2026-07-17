@@ -228,13 +228,45 @@ strategy window. The Monday-through-Friday tabs live inside that window rather t
 beside the application's top-level **Underlying Price** tab. Each weekday page shows
 a selectable 390-bin histogram above its session ledger. The histogram selector can
 display actual low/high occurrences or any 50%, 40%, 30%, 20%, or 10% downside or
-upside membership distribution.
+upside membership distribution. Selecting a histogram on any weekday page updates
+the selector and histogram on every other weekday page, making direct day-to-day
+comparisons possible without repeating the selection five times.
 
 The ledger reports each session's daily OHLC, median, actual low/high occurrence
 times, and selected quantile membership size and segment count. Hovering a ledger
 row overlays that session's contributing minutes in orange on the currently selected
-aggregate histogram. The detailed day charts and weekly ranking summary will be
-layered on this interface in subsequent implementation steps.
+aggregate histogram. The weekly ranking summary will be layered on this interface
+in a subsequent implementation step.
+
+Double-click a ledger row to construct its one-day detail chart on demand. No day
+chart or candlestick graphics are created during the study calculation or weekday
+page setup. The detail view draws all 390 one-minute candlesticks, marks every tied
+session-low and session-high occurrence, and displays solid downside and dashed
+upside price-threshold lines for the 50%, 40%, 30%, 20%, and 10% memberships.
+
+Hovering one of the colored percentage labels shades only that membership's
+piecewise qualifying minutes: downside shading extends from its threshold toward
+the bottom of the chart, while upside shading extends from its threshold toward the
+top. The levels use yellow, green, blue, purple, and pink respectively from 50%
+through 10%. Closing the detail dialog destroys its on-demand chart resources.
+
+The strategy's first internal tab is a **Summary** page. Every week containing at
+least one accepted session is included, including holiday and partial weeks. For
+lows, rank 1 is the lowest low among the weekdays present that week. For highs, rank
+1 is the highest high among the weekdays present. Ranks extend through the number of
+available sessions, so a four-session holiday week uses ranks 1 through 4. Each
+weekday's averages and win rates use only weeks in which that weekday participated.
+The page reports participation counts, average ranks, weekly-low and weekly-high win
+counts and rates, the study minimum and maximum, and the number of partial weeks.
+Price ties share their average rank and every tied winner receives a win.
+
+Completed calculation results are cached in memory by database, ticker, and date
+range. The cache contains session records, quantile memberships, weekday histogram
+counts, and weekly ranking summaries, so changing tabs or histogram percentages does
+not reread or reprocess one-minute bars. It is bounded to six study ranges and is
+cleared when the database changes or new bars are stored. Day-chart widgets,
+candlestick drawing geometry, and 10–50% hover highlighting are deliberately never
+cached; those resources remain on demand and are destroyed when their dialog closes.
 
 Choose **Momentum** from the chart's strategy dropdown to open its analysis
 dialog. By default it evaluates a 30-day rolling window over the latest year

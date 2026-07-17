@@ -20,6 +20,7 @@
 #include <QDataStream>
 #include <QDialog>
 #include <QDoubleSpinBox>
+#include <QEnterEvent>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -90,8 +91,16 @@ struct LoadResult {
     QString error;
 };
 
-struct IntradayDistributionOutput {
+struct CachedIntradayDistributionStudy {
     options::analysis::IntradayDistributionResult result;
+    std::array<options::analysis::IntradayWeekdayAggregation,5> weekdays;
+    options::analysis::IntradayWeeklySummary weekly_summary;
+};
+
+struct IntradayDistributionOutput {
+    std::shared_ptr<CachedIntradayDistributionStudy> study;
+    QString cache_key;
+    bool cached{};
     QString error;
 };
 
@@ -1549,6 +1558,166 @@ private:
     std::vector<int> highlighted_minutes_;
 };
 
+const std::array<QColor,5>& intraday_level_colors() {
+    static const std::array<QColor,5> colors{
+        QColor(235,195,30),QColor(55,165,85),QColor(45,115,210),
+        QColor(135,75,190),QColor(225,85,155)};
+    return colors;
+}
+
+class IntradayMetricHoverLabel final : public QLabel {
+public:
+    IntradayMetricHoverLabel(QString text,QColor color,QWidget* parent=nullptr)
+        :QLabel(std::move(text),parent) {
+        setAlignment(Qt::AlignCenter);
+        setMinimumWidth(48);
+        setContentsMargins(7,4,7,4);
+        setStyleSheet("QLabel { background: "+color.name()+
+            "; color: black; border: 1px solid rgba(0,0,0,80); border-radius: 3px; }");
+    }
+
+    std::function<void(bool)> hovered;
+
+protected:
+    void enterEvent(QEnterEvent* event) override {
+        QLabel::enterEvent(event);
+        if(hovered) hovered(true);
+    }
+
+    void leaveEvent(QEvent* event) override {
+        QLabel::leaveEvent(event);
+        if(hovered) hovered(false);
+    }
+};
+
+class IntradayDayChartWidget final : public QWidget {
+public:
+    explicit IntradayDayChartWidget(
+        const options::analysis::IntradaySessionRecord& session,QWidget* parent=nullptr)
+        :QWidget(parent),session_(session) {
+        setMinimumHeight(540);
+        setSizePolicy(QSizePolicy::Expanding,QSizePolicy::Expanding);
+    }
+
+    void set_hovered_membership(bool downside,int level) {
+        hovered_membership_=std::pair{downside,level};
+        update();
+    }
+
+    void clear_hovered_membership() {
+        hovered_membership_.reset();
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing,true);
+        painter.fillRect(rect(),palette().base());
+        constexpr int left=72;
+        constexpr int right=24;
+        constexpr int top=24;
+        constexpr int bottom=42;
+        const QRectF plot(left,top,std::max(1,width()-left-right),
+            std::max(1,height()-top-bottom));
+        const auto price_span=std::max(1e-9,session_.session_high-session_.session_low);
+        const auto price_min=session_.session_low-price_span*.03;
+        const auto price_max=session_.session_high+price_span*.03;
+        const auto price_y=[&](double price) {
+            return plot.bottom()-(price-price_min)/(price_max-price_min)*plot.height();
+        };
+        const auto bin_width=plot.width()/options::analysis::intraday_regular_session_minutes;
+
+        painter.setPen(QPen(QColor(205,205,205),1,Qt::DashLine));
+        for(int tick=0;tick<=4;++tick) {
+            const auto price=price_min+(price_max-price_min)*tick/4.0;
+            const auto y=price_y(price);
+            painter.drawLine(QPointF(plot.left(),y),QPointF(plot.right(),y));
+            painter.setPen(palette().text().color());
+            painter.drawText(QRectF(2,y-9,left-8,18),Qt::AlignRight,
+                QString::number(price,'f',2));
+            painter.setPen(QPen(QColor(205,205,205),1,Qt::DashLine));
+        }
+
+        if(hovered_membership_) {
+            const auto [downside,level]=*hovered_membership_;
+            const auto& membership=downside
+                ? session_.downside[static_cast<std::size_t>(level)]
+                : session_.upside[static_cast<std::size_t>(level)];
+            auto shade=intraday_level_colors()[static_cast<std::size_t>(level)];
+            shade.setAlpha(72);
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(shade);
+            const auto threshold_y=price_y(membership.price_threshold);
+            for(const auto& range:membership.ranges) {
+                const auto x=plot.left()+range.first_minute*bin_width;
+                const auto range_width=(range.last_minute-range.first_minute+1)*bin_width;
+                const QRectF shaded=downside
+                    ? QRectF(x,threshold_y,range_width,plot.bottom()-threshold_y)
+                    : QRectF(x,plot.top(),range_width,threshold_y-plot.top());
+                painter.drawRect(shaded.normalized());
+            }
+        }
+
+        for(std::size_t level=0;level<intraday_level_colors().size();++level) {
+            auto low_pen=QPen(intraday_level_colors()[level],1.2,Qt::SolidLine);
+            low_pen.setCosmetic(true);
+            painter.setPen(low_pen);
+            const auto low_y=price_y(session_.downside[level].price_threshold);
+            painter.drawLine(QPointF(plot.left(),low_y),QPointF(plot.right(),low_y));
+            auto high_pen=QPen(intraday_level_colors()[level],1.2,Qt::DashLine);
+            high_pen.setCosmetic(true);
+            painter.setPen(high_pen);
+            const auto high_y=price_y(session_.upside[level].price_threshold);
+            painter.drawLine(QPointF(plot.left(),high_y),QPointF(plot.right(),high_y));
+        }
+
+        painter.setRenderHint(QPainter::Antialiasing,false);
+        for(const auto& candle:session_.minutes) {
+            const auto x=plot.left()+(candle.minute_of_session+.5)*bin_width;
+            const auto rising=candle.close>=candle.open;
+            const auto color=rising ? QColor(35,155,85) : QColor(205,65,65);
+            painter.setPen(QPen(color,1));
+            painter.drawLine(QPointF(x,price_y(candle.high)),QPointF(x,price_y(candle.low)));
+            const auto open_y=price_y(candle.open);
+            const auto close_y=price_y(candle.close);
+            painter.setBrush(color);
+            painter.setPen(Qt::NoPen);
+            painter.drawRect(QRectF(x-std::max(0.6,bin_width*.32),
+                std::min(open_y,close_y),std::max(1.2,bin_width*.64),
+                std::max(1.0,std::abs(open_y-close_y))));
+        }
+
+        painter.setRenderHint(QPainter::Antialiasing,true);
+        painter.setBrush(QColor(20,125,220));
+        painter.setPen(QPen(Qt::white,1));
+        for(const auto minute:session_.low_minutes) {
+            const auto x=plot.left()+(minute+.5)*bin_width;
+            painter.drawEllipse(QPointF(x,price_y(session_.session_low)),4,4);
+        }
+        painter.setBrush(QColor(225,70,125));
+        for(const auto minute:session_.high_minutes) {
+            const auto x=plot.left()+(minute+.5)*bin_width;
+            painter.drawEllipse(QPointF(x,price_y(session_.session_high)),4,4);
+        }
+
+        painter.setPen(palette().text().color());
+        painter.drawLine(plot.bottomLeft(),plot.bottomRight());
+        const std::array<std::pair<int,const char*>,6> ticks{{
+            {0,"9:30"},{90,"11:00"},{180,"12:30"},{270,"2:00"},{360,"3:30"},{390,"4:00"}}};
+        for(const auto& [minute,label]:ticks) {
+            const auto x=plot.left()+plot.width()*minute/
+                options::analysis::intraday_regular_session_minutes;
+            painter.drawLine(QPointF(x,plot.bottom()),QPointF(x,plot.bottom()+4));
+            painter.drawText(QRectF(x-25,plot.bottom()+7,50,18),Qt::AlignHCenter,label);
+        }
+    }
+
+private:
+    options::analysis::IntradaySessionRecord session_;
+    std::optional<std::pair<bool,int>> hovered_membership_;
+};
+
 class IntradayLedgerTable final : public QTableWidget {
 public:
     using QTableWidget::QTableWidget;
@@ -1677,6 +1846,7 @@ private:
         try {
             database_path_=QFileInfo(path).absoluteFilePath();
             bar_store_=std::make_unique<options::data::SqliteBarStore>(database_path_.toStdString());
+            intraday_study_cache_.clear();
             QSettings("OptionsBacktester","OptionsBacktester").setValue("database",database_path_);
             load_stock_symbols();
         } catch(const std::exception& error) {
@@ -1836,6 +2006,70 @@ private:
     }
 
 
+    void show_intraday_day_chart(
+        const options::analysis::IntradaySessionRecord& session) {
+        QDialog dialog(this);
+        dialog.setWindowTitle("Intraday Distribution Day — "+
+            QString::fromStdString(session.date));
+        dialog.setWindowFlag(Qt::WindowMaximizeButtonHint,true);
+        dialog.setMinimumSize(1050,700);
+        const auto available_size=dialog.screen()->availableGeometry().size();
+        dialog.resize(qMin(1500,available_size.width()-40),
+            qMin(900,available_size.height()-40));
+        auto* layout=new QVBoxLayout(&dialog);
+        auto* summary=new QLabel(
+            "OHLC  "+QString::number(session.minutes.front().open,'f',2)+" / "+
+            QString::number(session.session_high,'f',2)+" / "+
+            QString::number(session.session_low,'f',2)+" / "+
+            QString::number(session.minutes.back().close,'f',2)+
+            "    Blue marker: session low    Pink marker: session high    "
+            "Solid line: downside threshold    Dashed line: upside threshold");
+        summary->setWordWrap(true);
+        layout->addWidget(summary);
+
+        auto* chart=new IntradayDayChartWidget(session);
+        auto* hover_controls=new QHBoxLayout;
+        hover_controls->addWidget(new QLabel("Hover downside:"));
+        for(std::size_t level=0;level<options::analysis::intraday_distribution_percentages.size();++level) {
+            const auto percentage=options::analysis::intraday_distribution_percentages[level];
+            auto* label=new IntradayMetricHoverLabel(
+                QString::number(percentage)+"%",intraday_level_colors()[level]);
+            label->setToolTip("Shade the lowest "+QString::number(percentage)+
+                "% of one-minute candle averages below $"+
+                QString::number(session.downside[level].price_threshold,'f',2));
+            label->hovered=[chart,level](bool entered) {
+                if(entered) chart->set_hovered_membership(true,static_cast<int>(level));
+                else chart->clear_hovered_membership();
+            };
+            hover_controls->addWidget(label);
+        }
+        hover_controls->addSpacing(20);
+        hover_controls->addWidget(new QLabel("Hover upside:"));
+        for(std::size_t level=0;level<options::analysis::intraday_distribution_percentages.size();++level) {
+            const auto percentage=options::analysis::intraday_distribution_percentages[level];
+            auto* label=new IntradayMetricHoverLabel(
+                QString::number(percentage)+"%",intraday_level_colors()[level]);
+            label->setToolTip("Shade the highest "+QString::number(percentage)+
+                "% of one-minute candle averages above $"+
+                QString::number(session.upside[level].price_threshold,'f',2));
+            label->hovered=[chart,level](bool entered) {
+                if(entered) chart->set_hovered_membership(false,static_cast<int>(level));
+                else chart->clear_hovered_membership();
+            };
+            hover_controls->addWidget(label);
+        }
+        hover_controls->addStretch();
+        layout->addLayout(hover_controls);
+        layout->addWidget(chart,1);
+        auto* hint=new QLabel(
+            "Shading is generated only for the hovered level and only across its qualifying "
+            "piecewise one-minute ranges. This day chart is created on demand from the "
+            "double-clicked ledger record.");
+        hint->setWordWrap(true);
+        layout->addWidget(hint);
+        dialog.exec();
+    }
+
     void show_intraday_distribution_analysis() {
         const auto symbol=stock_symbol_->currentText();
         if(symbol.isEmpty() || !available_start_.isValid() || !available_end_.isValid()) {
@@ -1917,14 +2151,77 @@ private:
                 status->setText("Study failed: "+output.error);
                 return;
             }
+            if(!output.study) {
+                status->setText("Study failed: no analysis result was produced.");
+                return;
+            }
+            if(!output.cached) {
+                if(intraday_study_cache_.size()>=6)
+                    intraday_study_cache_.erase(intraday_study_cache_.begin());
+                intraday_study_cache_[output.cache_key]=output.study;
+            }
             while(weekday_tabs->count()>0) delete weekday_tabs->widget(0);
-            auto analysis=std::make_shared<options::analysis::IntradayDistributionResult>(
-                std::move(output.result));
-            auto weekdays=std::make_shared<std::array<
-                options::analysis::IntradayWeekdayAggregation,5>>(
-                options::analysis::aggregate_intraday_weekdays(analysis->sessions));
+            auto study=output.study;
+            auto analysis=std::shared_ptr<options::analysis::IntradayDistributionResult>(
+                study,&study->result);
+            auto weekdays=std::shared_ptr<std::array<
+                options::analysis::IntradayWeekdayAggregation,5>>(study,&study->weekdays);
             static const QStringList weekday_names{
                 "Monday","Tuesday","Wednesday","Thursday","Friday"};
+
+            auto* summary_page=new QWidget;
+            auto* summary_layout=new QVBoxLayout(summary_page);
+            const auto& weekly=study->weekly_summary;
+            auto* summary_heading=new QLabel(
+                "Study range: $"+QString::number(weekly.study_minimum,'f',2)+" minimum to $"+
+                QString::number(weekly.study_maximum,'f',2)+" maximum    Weeks analyzed: "+
+                QString::number(weekly.weeks_analyzed)+"    Holiday/partial weeks: "+
+                QString::number(weekly.partial_weeks));
+            summary_heading->setWordWrap(true);
+            summary_layout->addWidget(summary_heading);
+            auto* rank_explanation=new QLabel(
+                "Low rank 1 is the lowest low among the weekdays present that week. High rank 1 "
+                "is the highest high among those weekdays. Holiday and partial weeks are included; "
+                "their ranks run from 1 through the number of available sessions. Ties share their "
+                "average rank and count as wins for every tied day.");
+            rank_explanation->setWordWrap(true);
+            summary_layout->addWidget(rank_explanation);
+            auto* summary_table=new QTableWidget(5,8);
+            summary_table->setHorizontalHeaderLabels({"Weekday","Weeks represented","Average low rank",
+                "Weekly-low wins","Low win rate","Average high rank","Weekly-high wins",
+                "High win rate"});
+            summary_table->setAlternatingRowColors(true);
+            summary_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+            summary_table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+            for(int row=0;row<5;++row) {
+                const auto& weekday=weekly.weekdays[static_cast<std::size_t>(row)];
+                summary_table->setItem(row,0,new QTableWidgetItem(weekday_names[row]));
+                const auto rank_text=[&](double value) {
+                    return weekday.weeks_participated==0
+                        ? QString("—") : QString::number(value,'f',2);
+                };
+                summary_table->setItem(row,1,new QTableWidgetItem(
+                    QString::number(weekday.weeks_participated)));
+                summary_table->setItem(row,2,new QTableWidgetItem(
+                    rank_text(weekday.average_low_rank)));
+                summary_table->setItem(row,3,new QTableWidgetItem(
+                    QString::number(weekday.weekly_low_wins)));
+                summary_table->setItem(row,4,new QTableWidgetItem(
+                    QString::number(weekday.weekly_low_win_percent,'f',1)+"%"));
+                summary_table->setItem(row,5,new QTableWidgetItem(
+                    rank_text(weekday.average_high_rank)));
+                summary_table->setItem(row,6,new QTableWidgetItem(
+                    QString::number(weekday.weekly_high_wins)));
+                summary_table->setItem(row,7,new QTableWidgetItem(
+                    QString::number(weekday.weekly_high_win_percent,'f',1)+"%"));
+            }
+            summary_layout->addWidget(summary_table);
+            summary_layout->addStretch();
+            weekday_tabs->addTab(summary_page,"Summary");
+
+            auto histogram_selectors=std::make_shared<std::vector<QComboBox*>>();
+            auto synchronized_histogram_index=std::make_shared<int>(0);
+            auto synchronizing_histograms=std::make_shared<bool>(false);
 
             for(int weekday_index=0;weekday_index<5;++weekday_index) {
                 auto* page=new QWidget;
@@ -1935,6 +2232,8 @@ private:
                     "Downside 50%","Downside 40%","Downside 30%","Downside 20%",
                     "Downside 10%","Upside 50%","Upside 40%","Upside 30%",
                     "Upside 20%","Upside 10%"});
+                histogram_choice->setCurrentIndex(*synchronized_histogram_index);
+                histogram_selectors->push_back(histogram_choice);
                 histogram_controls->addWidget(new QLabel("Histogram:"));
                 histogram_controls->addWidget(histogram_choice);
                 histogram_controls->addStretch();
@@ -2000,6 +2299,16 @@ private:
                 };
                 connect(histogram_choice,&QComboBox::currentIndexChanged,page,
                     [select_histogram](int){ select_histogram(); });
+                connect(histogram_choice,&QComboBox::currentIndexChanged,page,
+                    [histogram_selectors,synchronized_histogram_index,
+                     synchronizing_histograms](int index) {
+                    if(*synchronizing_histograms) return;
+                    *synchronizing_histograms=true;
+                    *synchronized_histogram_index=index;
+                    for(auto* selector:*histogram_selectors)
+                        if(selector->currentIndex()!=index) selector->setCurrentIndex(index);
+                    *synchronizing_histograms=false;
+                });
                 select_histogram();
 
                 connect(ledger,&QTableWidget::cellEntered,page,
@@ -2016,11 +2325,18 @@ private:
                     else histogram->set_highlighted_minutes(
                         session.upside[static_cast<std::size_t>(selection-7)].minutes);
                 });
+                connect(ledger,&QTableWidget::cellDoubleClicked,page,
+                    [this,analysis,session_indices](int row,int) {
+                    if(row<0 || static_cast<std::size_t>(row)>=session_indices.size()) return;
+                    show_intraday_day_chart(analysis->sessions[
+                        session_indices[static_cast<std::size_t>(row)]]);
+                });
                 ledger->mouse_left=[histogram] { histogram->set_highlighted_minutes({}); };
                 weekday_tabs->addTab(page,weekday_names[weekday_index]+" ("+
                     QString::number(session_indices.size())+")");
             }
-            status->setText("Accepted "+QString::number(analysis->sessions.size())+" of "+
+            status->setText(QString(output.cached ? "Loaded cached analysis. " : "Analysis cached. ")+
+                "Accepted "+QString::number(analysis->sessions.size())+" of "+
                 QString::number(analysis->candidate_sessions)+" candidate sessions. Excluded "+
                 QString::number(analysis->excluded_incomplete_sessions)+
                 " incomplete/short and "+QString::number(analysis->excluded_invalid_sessions)+
@@ -2059,16 +2375,38 @@ private:
             const auto selected_symbol=ticker->currentText();
             const auto start_text=start->date().toString(Qt::ISODate);
             const auto end_text=end->date().toString(Qt::ISODate);
-            watcher->setFuture(QtConcurrent::run(
-                [database_path,selected_symbol,start_text,end_text] {
+            const auto cache_key=database_path+"|"+selected_symbol+"|"+start_text+"|"+end_text;
+            const auto cached=intraday_study_cache_.find(cache_key);
+            if(cached!=intraday_study_cache_.end()) {
+                status->setText("Loading cached session records, histograms, and summary…");
+                const auto cached_study=cached->second;
+                watcher->setFuture(QtConcurrent::run([cached_study,cache_key] {
                     IntradayDistributionOutput output;
+                    output.study=cached_study;
+                    output.cache_key=cache_key;
+                    output.cached=true;
+                    return output;
+                }));
+                return;
+            }
+            status->setText("Building one-minute session records, histograms, and summary…");
+            watcher->setFuture(QtConcurrent::run(
+                [database_path,selected_symbol,start_text,end_text,cache_key] {
+                    IntradayDistributionOutput output;
+                    output.cache_key=cache_key;
                     try {
                         options::data::SqliteBarStore store(database_path.toStdString());
                         const auto bars=store.load({selected_symbol.toStdString(),"alpaca","iex",
                             options::data::stock_bar_timeframe,"all",start_text.toStdString(),
                             end_text.toStdString()});
-                        output.result=options::analysis::analyze_intraday_distribution(bars);
+                        output.study=std::make_shared<CachedIntradayDistributionStudy>();
+                        output.study->result=options::analysis::analyze_intraday_distribution(bars);
+                        output.study->weekdays=options::analysis::aggregate_intraday_weekdays(
+                            output.study->result.sessions);
+                        output.study->weekly_summary=options::analysis::summarize_intraday_weeks(
+                            output.study->result.sessions);
                     } catch(const std::exception& error) {
+                        output.study.reset();
                         output.error=QString::fromUtf8(error.what());
                     }
                     return output;
@@ -3123,6 +3461,7 @@ private:
                 ? "Alpaca returned no IEX one-minute bars for "+result.symbol+" in the selected range."
                 : "Loaded "+QString::number(result.downloaded)+" one-minute bars for "+result.symbol+".");
         if(result.database_path==database_path_) {
+            if(result.downloaded>0) intraday_study_cache_.clear();
             load_stock_symbols();
             const auto index=stock_symbol_->findText(result.symbol);
             if(index>=0) stock_symbol_->setCurrentIndex(index);
@@ -3223,6 +3562,7 @@ private:
     QPushButton* load_button_{};
     QLabel* load_status_{};
     QFutureWatcher<LoadResult>* load_watcher_{};
+    std::map<QString,std::shared_ptr<CachedIntradayDistributionStudy>> intraday_study_cache_;
     bool candle_interval_overridden_{};
 };
 

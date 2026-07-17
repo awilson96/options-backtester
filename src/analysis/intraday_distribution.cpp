@@ -185,4 +185,83 @@ std::array<IntradayWeekdayAggregation,5> aggregate_intraday_weekdays(
     return weekdays;
 }
 
+IntradayWeeklySummary summarize_intraday_weeks(
+    std::span<const IntradaySessionRecord> sessions) {
+    std::map<std::pair<int,int>,std::array<const IntradaySessionRecord*,5>> weeks;
+    IntradayWeeklySummary summary;
+    if(!sessions.empty()) {
+        summary.study_minimum=std::ranges::min_element(
+            sessions,{},&IntradaySessionRecord::session_low)->session_low;
+        summary.study_maximum=std::ranges::max_element(
+            sessions,{},&IntradaySessionRecord::session_high)->session_high;
+    }
+    for(std::size_t index=0;index<summary.weekdays.size();++index)
+        summary.weekdays[index].weekday=static_cast<int>(index+1);
+    for(const auto& session:sessions) {
+        if(session.weekday<1 || session.weekday>5) continue;
+        const auto date=QDate::fromString(QString::fromStdString(session.date),Qt::ISODate);
+        if(!date.isValid()) continue;
+        int week_year{};
+        const auto week_number=date.weekNumber(&week_year);
+        weeks[{week_year,week_number}][static_cast<std::size_t>(session.weekday-1)]=&session;
+    }
+
+    for(const auto& entry:weeks) {
+        const auto& days=entry.second;
+        const auto available_days=static_cast<int>(std::ranges::count_if(
+            days,[](const auto* day){ return day!=nullptr; }));
+        if(available_days==0) continue;
+        ++summary.weeks_analyzed;
+        if(available_days<5) ++summary.partial_weeks;
+        for(std::size_t index=0;index<days.size();++index) {
+            if(days[index]==nullptr) continue;
+            int lower_lows=0;
+            int equal_lows=0;
+            int higher_highs=0;
+            int equal_highs=0;
+            for(const auto* other:days) {
+                if(other==nullptr) continue;
+                if(approximately_equal(other->session_low,days[index]->session_low))
+                    ++equal_lows;
+                else if(other->session_low<days[index]->session_low)
+                    ++lower_lows;
+                if(approximately_equal(other->session_high,days[index]->session_high))
+                    ++equal_highs;
+                else if(other->session_high>days[index]->session_high)
+                    ++higher_highs;
+            }
+            auto& weekday=summary.weekdays[index];
+            ++weekday.weeks_participated;
+            weekday.average_low_rank+=1.0+lower_lows+(equal_lows-1)/2.0;
+            weekday.average_high_rank+=1.0+higher_highs+(equal_highs-1)/2.0;
+            const auto week_low=std::ranges::min_element(
+                days,[](const auto* left,const auto* right) {
+                    if(left==nullptr) return false;
+                    if(right==nullptr) return true;
+                    return left->session_low<right->session_low;
+                });
+            const auto week_high=std::ranges::max_element(
+                days,[](const auto* left,const auto* right) {
+                    if(left==nullptr) return true;
+                    if(right==nullptr) return false;
+                    return left->session_high<right->session_high;
+                });
+            if(approximately_equal(days[index]->session_low,(*week_low)->session_low))
+                ++weekday.weekly_low_wins;
+            if(approximately_equal(days[index]->session_high,(*week_high)->session_high))
+                ++weekday.weekly_high_wins;
+        }
+    }
+    for(auto& weekday:summary.weekdays) {
+        if(weekday.weeks_participated==0) continue;
+        weekday.average_low_rank/=weekday.weeks_participated;
+        weekday.average_high_rank/=weekday.weeks_participated;
+        weekday.weekly_low_win_percent=
+            100.0*weekday.weekly_low_wins/weekday.weeks_participated;
+        weekday.weekly_high_win_percent=
+            100.0*weekday.weekly_high_wins/weekday.weeks_participated;
+    }
+    return summary;
+}
+
 }  // namespace options::analysis

@@ -17,9 +17,10 @@ options::data::Bar minute_bar(const QDate& date,int minute,double price) {
         price-0.5,price,100,10,price};
 }
 
-void add_session(std::vector<options::data::Bar>& bars,const QDate& date,int minutes=390) {
+void add_session(std::vector<options::data::Bar>& bars,const QDate& date,int minutes=390,
+                 double base_price=100.0) {
     for(int minute=0;minute<minutes;++minute)
-        bars.push_back(minute_bar(date,minute,100.0+minute));
+        bars.push_back(minute_bar(date,minute,base_price+minute));
 }
 
 }  // namespace
@@ -149,4 +150,33 @@ TEST_CASE("intraday distribution observes Eastern daylight-saving transitions") 
     REQUIRE(weekdays[0].highs.counts[389]==2);
     REQUIRE(weekdays[0].downside[4].total_occurrences==78);
     REQUIRE(weekdays[0].upside[4].total_occurrences==78);
+}
+
+TEST_CASE("intraday distribution summarizes complete and partial trading-week rankings") {
+    std::vector<options::data::Bar> bars;
+    const auto monday=QDate(2025,1,6);
+    for(int weekday=0;weekday<5;++weekday)
+        add_session(bars,monday.addDays(weekday),390,100.0+weekday*1000.0);
+    add_session(bars,monday.addDays(7));
+    add_session(bars,monday.addDays(15));
+
+    const auto result=options::analysis::analyze_intraday_distribution(bars);
+    const auto summary=options::analysis::summarize_intraday_weeks(result.sessions);
+    REQUIRE(summary.weeks_analyzed==3);
+    REQUIRE(summary.partial_weeks==2);
+    REQUIRE(summary.study_minimum==99.5);
+    REQUIRE(summary.study_maximum==4489.5);
+    REQUIRE(summary.weekdays[0].average_low_rank==1.0);
+    REQUIRE(summary.weekdays[0].average_high_rank==3.0);
+    REQUIRE(summary.weekdays[0].weeks_participated==2);
+    REQUIRE(summary.weekdays[0].weekly_low_wins==2);
+    REQUIRE(summary.weekdays[0].weekly_low_win_percent==100.0);
+    REQUIRE(summary.weekdays[1].weeks_participated==2);
+    REQUIRE(summary.weekdays[1].average_low_rank==1.5);
+    REQUIRE(summary.weekdays[1].average_high_rank==2.5);
+    REQUIRE(summary.weekdays[4].average_low_rank==5.0);
+    REQUIRE(summary.weekdays[4].average_high_rank==1.0);
+    REQUIRE(summary.weekdays[4].weeks_participated==1);
+    REQUIRE(summary.weekdays[4].weekly_high_wins==1);
+    REQUIRE(summary.weekdays[4].weekly_high_win_percent==100.0);
 }
