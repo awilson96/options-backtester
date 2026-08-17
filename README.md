@@ -291,21 +291,27 @@ cleared when the database changes or new bars are stored. Day-chart widgets,
 candlestick drawing geometry, and 10–50% hover highlighting are deliberately never
 cached; those resources remain on demand and are destroyed when their dialog closes.
 
-Choose **Momentum** from the chart's strategy dropdown to open its analysis
-dialog. By default it evaluates a 30-day rolling window over the latest year
+Choose **Bullish Vertical Spread** or **Bearish Vertical Spread** from the chart's
+strategy dropdown to open its analysis dialog. The bullish study models the directional
+boundary shared by a call debit spread and a bull put credit spread; the bearish study
+reverses the comparison for a put debit spread or call credit spread. By default each
+evaluates a 30-day rolling window over the latest year
 of stored data. For each bar q, r is the first stored bar at or after q's exact
 timestamp plus the configured number of calendar days. The default window is 30
 days.
 The skip window d controls how often a new comparison begins and defaults to one
 day; for example, d=4 makes a Monday entry next eligible on Friday. If an eligible
 date is not a trading day, the next stored trading day is used. The dialog reports
-how often the one-minute analysis price at r was greater than at q, along with win, loss,
-tie, and total comparison counts. Both windows and the analysis date range are
+how often the later price produced a directional win, along with win, loss, tie, and
+total comparison counts. With strike adjustment enabled, bullish studies compare with
+the upper spread leg and bearish studies compare with the lower spread leg. Both windows
+and the analysis date range are
 configurable.
 
-Select **Save Study…** in the Momentum dialog to store a named preset. Saved
+Select **Save Study…** in either vertical-spread dialog to store a named preset. Saved
 studies appear in a dropdown above the chart on the **Underlying Price** page.
-Choose a study and select **Load** to select its associated ticker and open Momentum with its
+Choose a study and select **Load** to select its associated ticker and open the correct
+directional vertical-spread analysis with its
 single or parametric ranges, analysis dates, strike settings, simulated pricing,
 allocation, drop rate, and slippage restored. Loading only fills the dialog; it
 does not run the analysis until **Run Analysis** or **Run Parametric Study** is
@@ -330,8 +336,8 @@ row is selected. Pressing **Run Analysis** always performs a fresh calculation;
 there is no automatic result-cache lookup or reuse. If the displayed parameters
 have not been run, only the study template is saved.
 
-Momentum defaults to VWAP as the analysis price, falling back to close only when
-VWAP is unavailable. The Momentum dialog can aggregate regular-session data into
+Vertical-spread analysis defaults to VWAP as the analysis price, falling back to close only when
+VWAP is unavailable. Its dialog can aggregate regular-session data into
 **1 Day**, **1 Hour**, **30 Min**, **15 Min**, **5 Min**, or **1 Min** bars and analyze
 each bar's **Open**, **Close**, **High**, **Low**, **Average**, or **VWAP**. **Average**
 is the arithmetic mean of that aggregated candle's open and close. Multi-day studies
@@ -350,7 +356,7 @@ price is drawn in very light grey against a separate price axis on the right. It
 chart's date axis but cannot change the account-value scale on the left. No
 additional scenario columns are added to the parametric table.
 
-For d greater than one, momentum evaluates all d distinct calendar-phase starts.
+For d greater than one, vertical-spread analysis evaluates all d distinct calendar-phase starts.
 It reports the average wins, losses, ties, comparisons, and win percentage for one
 start phase rather than inflating the figures by aggregating all phases. This
 reduces the effect of an unusually lucky or unlucky initial entry date.
@@ -363,11 +369,13 @@ resolution and $5 width, the available spreads include 490/495, 491/496, and
 492/497. Offset -1 selects one resolution step below the current-price boundary,
 +1 selects one step above it, and larger magnitudes move farther along the
 resolution grid; offset 0 uses the nearest grid price. The selected grid price is
-the lower spread leg, and the comparison threshold is `lower leg + strike width`.
+the lower spread leg. A bullish study uses `lower leg + strike width` (the upper
+leg) as its comparison threshold; a bearish study uses the lower leg itself.
 For example, price $756.56 with $1 resolution, $5 width, and offset -2 produces
 755/760 and a $760 comparison price. Price $451.32 with $2.50 resolution, $5
-width, and offset +2 produces 455/460 and a $460 comparison price. The ledger and
-hover shading use this same upper spread boundary. In parametric mode only the
+width, and offset +2 produces 455/460 and a $460 bullish comparison price or a
+$455 bearish comparison price. The ledger and hover shading use the applicable
+directional boundary. In parametric mode only the
 strike-offset range is swept alongside x and d.
 
 Enable **Use simulated spread pricing** to provide one-contract maximum-profit and
@@ -379,7 +387,7 @@ profit and percentage profit appear in parametric results; percentage profit is
 row to open its simulated account-value chart. A non-parametric analysis opens its
 chart immediately. Chart titles identify `DTE`, `skip`, `res`, `strike_width`, and
 the configured `strike_offset`. Account curves and totals are averaged across skip-window start
-phases in the same way as the momentum statistics. Parametric table headers use
+phases in the same way as the vertical-spread statistics. Parametric table headers use
 **DTE**, **Skip**, and **Win Rate %**, omit the average-ties and Rank columns, and
 use the table's built-in row numbers for the current rank.
 
@@ -389,8 +397,8 @@ or retaining per-date curve points.
 Double-clicking a simulated-pricing result row reconstructs only that row's
 deterministic median drop scenario on the background worker, then opens its
 four-line profit chart with an executed-trades table underneath. The ledger lists
-start and end dates, underlying start and end prices, comparison price, ITM/OTM
-(or ATM for an exact tie), skip-start phase, realized one-contract profit or loss,
+start and end dates, underlying start and end prices, comparison price, Win/Loss
+(or Tie for an exact boundary match), skip-start phase, realized one-contract profit or loss,
 and money currently at risk. This is the concurrent max-loss capital, including
 applicable slippage, reserved immediately after that trade opens within its
 skip-start phase. Positions that have already expired are released first, and the
@@ -400,14 +408,14 @@ averaged across multiple start schedules, the phase column identifies which
 schedule produced each execution. The generated ledger is reused for later opens
 of that row during the current session.
 
-Hovering over an ITM or OTM ledger row focuses its holding period on the chart.
+Hovering over a Win or Loss ledger row focuses its holding period on the chart.
 The four profit curves fade to light variants of their original colors, the
 underlying-price line becomes black, vertical guides mark the start and end dates,
 and a horizontal boundary marks that trade's computed comparison strike. Within
 the start-to-end interval, the area above the strike is shaded green and the area
 below it red. The boundary uses the exact strike grid and offset for the selected
 strategy row, including offsets such as -2 or +2. Moving away from the row restores
-the normal chart styling. ATM rows intentionally have no hover treatment yet.
+the normal chart styling. Tie rows intentionally have no hover treatment yet.
 
 Simulated pricing also supports fixed slippage on neither side, the buy only, the
 sell only, or both buy and sell. Buy and sell slippage have independent inputs and
@@ -436,7 +444,7 @@ active ordering.
 Single-value DTE, Skip, and Strike Offset fields are hidden while parametric mode
 is active; their inclusive range controls take their place.
 
-Momentum calculations run on a background worker so long parametric studies do
+Vertical-spread calculations run on a background worker so long parametric studies do
 not block the desktop interface or cause operating-system “not responding”
 warnings. Independent parameter combinations are distributed through a thread-safe
 work queue. On systems with four or more reported logical
@@ -465,7 +473,7 @@ reported without discarding the completed analysis or saved parameters. Paramete
 save, and run controls are temporarily locked during their respective background
 operations so displayed results always correspond to the captured settings.
 
-The Momentum dialog opens at a screen-aware size, can be maximized or expanded
+The vertical-spread dialog opens at a screen-aware size, can be maximized or expanded
 without an application-imposed maximum width, and automatically grows when
 parametric or simulated-pricing controls need additional room. Result columns keep
 readable widths and scroll horizontally when necessary, while large collections

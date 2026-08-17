@@ -74,7 +74,36 @@ TEST_CASE("momentum comparison price uses the second spread leg one strike width
     REQUIRE(result.trades.size()==1);
     REQUIRE(result.trades.front().comparison_price==12.5);
     REQUIRE(result.trades.front().result==
-        options::analysis::MomentumResult::TradeResult::itm);
+        options::analysis::MomentumResult::TradeResult::win);
+}
+
+TEST_CASE("bearish vertical spread wins when the later price falls") {
+    const std::vector<options::data::Bar> bars{
+        {"TEST","2024-01-01T00:00:00Z",0,0,0,12},
+        {"TEST","2024-01-02T00:00:00Z",0,0,0,11},
+    };
+    const auto result=options::analysis::analyze_momentum_drop_scenarios(
+        bars,1,1,std::nullopt,std::nullopt,0,5,true,true,
+        options::analysis::VerticalSpreadDirection::bearish);
+    REQUIRE(result.wins==1);
+    REQUIRE(result.losses==0);
+    REQUIRE(result.trades.front().result==
+        options::analysis::MomentumResult::TradeResult::win);
+}
+
+TEST_CASE("bearish vertical spread compares against the lower spread leg") {
+    const std::vector<options::data::Bar> bars{
+        {"TEST","2024-01-01T00:00:00Z",0,0,0,12},
+        {"TEST","2024-01-02T00:00:00Z",0,0,0,12},
+    };
+    const auto result=options::analysis::analyze_momentum(
+        bars,1,1,options::analysis::StrikeAdjustment{2.5,2.5,0},
+        options::analysis::SimulatedPricing{100,100,1000},0,0,true,true,
+        options::analysis::VerticalSpreadDirection::bearish);
+    REQUIRE(result.trades.size()==1);
+    REQUIRE(result.trades.front().comparison_price==12.5);
+    REQUIRE(result.trades.front().result==
+        options::analysis::MomentumResult::TradeResult::win);
 }
 
 TEST_CASE("momentum strike offsets move along the configured resolution grid") {
@@ -134,10 +163,10 @@ TEST_CASE("momentum generates an executed trade ledger only when requested") {
     REQUIRE(with_ledger.trades.front().start_price==10);
     REQUIRE(with_ledger.trades.front().end_price==11);
     REQUIRE(with_ledger.trades.front().result==
-        options::analysis::MomentumResult::TradeResult::itm);
+        options::analysis::MomentumResult::TradeResult::win);
     REQUIRE(with_ledger.trades.front().money_at_risk==300);
     REQUIRE(with_ledger.trades.back().result==
-        options::analysis::MomentumResult::TradeResult::otm);
+        options::analysis::MomentumResult::TradeResult::loss);
 }
 
 TEST_CASE("momentum summary mode preserves profits without constructing curves") {

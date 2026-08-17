@@ -82,6 +82,11 @@
 
 namespace {
 
+QString vertical_spread_name(options::analysis::VerticalSpreadDirection direction) {
+    return direction==options::analysis::VerticalSpreadDirection::bullish
+        ? "Bullish Vertical Spread" : "Bearish Vertical Spread";
+}
+
 class ComboBoxWheelFilter final : public QObject {
 protected:
     bool eventFilter(QObject* watched,QEvent* event) override {
@@ -195,6 +200,8 @@ struct MomentumStudyPreset {
     int strike_maximum{1};
     std::map<int,std::pair<double,double>> pricing;
     QString saved_result_key;
+    options::analysis::VerticalSpreadDirection direction{
+        options::analysis::VerticalSpreadDirection::bullish};
 };
 
 std::vector<MomentumStudyPreset> load_study_presets() {
@@ -203,7 +210,8 @@ std::vector<MomentumStudyPreset> load_study_presets() {
     std::vector<MomentumStudyPreset> presets;
     for(const auto& id:settings.childGroups()) {
         settings.beginGroup(id);
-        if(settings.value("strategy","momentum").toString()=="momentum") {
+        const auto strategy=settings.value("strategy","momentum").toString();
+        if(strategy=="momentum" || strategy=="vertical_spread") {
             MomentumStudyPreset value;
             value.id=id;
             value.name=settings.value("name","Unnamed study").toString();
@@ -234,6 +242,10 @@ std::vector<MomentumStudyPreset> load_study_presets() {
             value.strike_maximum=settings.value("strike_maximum",1).toInt();
             value.saved_result_key=settings.value("saved_result_key",
                 settings.value("result_cache_key")).toString();
+            const auto direction=settings.value("direction",0).toInt();
+            value.direction=direction==1
+                ? options::analysis::VerticalSpreadDirection::bearish
+                : options::analysis::VerticalSpreadDirection::bullish;
             const auto pricing_count=settings.beginReadArray("pricing");
             for(int index=0;index<pricing_count;++index) {
                 settings.setArrayIndex(index);
@@ -257,8 +269,9 @@ void save_study_preset(const MomentumStudyPreset& value) {
     settings.beginGroup("saved_studies");
     settings.beginGroup(value.id);
     settings.remove("");
-    settings.setValue("schema_version",5);
-    settings.setValue("strategy","momentum");
+    settings.setValue("schema_version",6);
+    settings.setValue("strategy","vertical_spread");
+    settings.setValue("direction",static_cast<int>(value.direction));
     settings.setValue("name",value.name);
     settings.setValue("symbol",value.symbol);
     settings.setValue("parametric",value.parametric);
@@ -398,8 +411,8 @@ bool read_momentum_result(
         qint32 result{};
         stream>>start_date>>end_date>>trade.start_price>>trade.end_price
               >>trade.comparison_price>>trade.profit>>phase>>result;
-        if(result<static_cast<qint32>(options::analysis::MomentumResult::TradeResult::itm) ||
-           result>static_cast<qint32>(options::analysis::MomentumResult::TradeResult::atm))
+        if(result<static_cast<qint32>(options::analysis::MomentumResult::TradeResult::win) ||
+           result>static_cast<qint32>(options::analysis::MomentumResult::TradeResult::tie))
             return false;
         trade.start_date=start_date.toStdString();
         trade.end_date=end_date.toStdString();
@@ -464,7 +477,8 @@ QByteArray momentum_preset_bytes(const MomentumStudyPreset& value) {
     QByteArray bytes;
     QDataStream stream(&bytes,QIODevice::WriteOnly);
     stream.setVersion(QDataStream::Qt_6_0);
-    stream<<saved_result_version<<value.symbol<<value.parametric<<value.window_days
+    stream<<saved_result_version<<static_cast<qint32>(value.direction)
+          <<value.symbol<<value.parametric<<value.window_days
           <<value.skip_days<<value.bar_minutes<<value.price_field
           <<value.drop_rate<<value.strike_enabled<<value.strike_width
           <<value.strike_resolution
@@ -828,7 +842,7 @@ public:
 
     void highlight_trade(
         std::optional<options::analysis::MomentumResult::TradeRecord> trade) {
-        if(trade && trade->result==options::analysis::MomentumResult::TradeResult::atm)
+        if(trade && trade->result==options::analysis::MomentumResult::TradeResult::tie)
             trade.reset();
         highlighted_trade_=std::move(trade);
         const QColor muted_colors[]{QColor("#d9e5f2"),QColor("#d8eed9"),
@@ -1076,9 +1090,9 @@ void show_profit_chart(QWidget* parent,const QString& title,
         ledger->horizontalHeader()->setStretchLastSection(true);
         for(int row=0;row<static_cast<int>(result.trades.size());++row) {
             const auto& trade=result.trades[static_cast<std::size_t>(row)];
-            const auto result_text=trade.result==options::analysis::MomentumResult::TradeResult::itm
-                ? "ITM" : trade.result==options::analysis::MomentumResult::TradeResult::otm
-                    ? "OTM" : "ATM";
+            const auto result_text=trade.result==options::analysis::MomentumResult::TradeResult::win
+                ? "Win" : trade.result==options::analysis::MomentumResult::TradeResult::loss
+                    ? "Loss" : "Tie";
             ledger->setItem(row,0,new QTableWidgetItem(QString::fromStdString(trade.start_date)));
             ledger->setItem(row,1,new QTableWidgetItem(QString::fromStdString(trade.end_date)));
             ledger->setItem(row,2,new NumericTableWidgetItem(
@@ -1101,7 +1115,7 @@ void show_profit_chart(QWidget* parent,const QString& title,
                 return;
             }
             const auto& trade=result.trades[static_cast<std::size_t>(*row)];
-            if(trade.result==options::analysis::MomentumResult::TradeResult::atm) {
+            if(trade.result==options::analysis::MomentumResult::TradeResult::tie) {
                 view->highlight_trade(std::nullopt);
                 return;
             }
@@ -1928,7 +1942,8 @@ public:
         auto* stock_controls=new QHBoxLayout;
         stock_symbol_=new QComboBox;
         strategy_=new QComboBox;
-        strategy_->addItems({"Select strategy…","Momentum","Intraday Distribution"});
+        strategy_->addItems({"Select strategy…","Bullish Vertical Spread",
+                             "Bearish Vertical Spread","Intraday Distribution"});
         candle_interval_=new QComboBox;
         candle_interval_->addItem("1 Day",0);
         candle_interval_->addItem("1 Hour",60);
@@ -2009,8 +2024,11 @@ public:
             plot_underlying();
         });
         connect(strategy_,&QComboBox::activated,this,[this](int index){
-            if(index==1) show_momentum_analysis();
-            else if(index==2) show_intraday_distribution_analysis();
+            if(index==1) show_momentum_analysis(
+                std::nullopt,options::analysis::VerticalSpreadDirection::bullish);
+            else if(index==2) show_momentum_analysis(
+                std::nullopt,options::analysis::VerticalSpreadDirection::bearish);
+            else if(index==3) show_intraday_distribution_analysis();
             strategy_->setCurrentIndex(0);
         });
         connect(load_button_,&QPushButton::clicked,this,[this]{ load_symbol_data(); });
@@ -2180,9 +2198,11 @@ private:
         load_study_button_->setEnabled(true);
         delete_study_button_->setEnabled(true);
         for(const auto& preset:presets) {
-            saved_studies_->addItem(preset.name+" — "+preset.symbol,preset.id);
+            saved_studies_->addItem(
+                preset.name+" — "+preset.symbol+" — "+vertical_spread_name(preset.direction),
+                preset.id);
             saved_studies_->setItemData(saved_studies_->count()-1,
-                "Momentum study for "+preset.symbol,Qt::ToolTipRole);
+                vertical_spread_name(preset.direction)+" study for "+preset.symbol,Qt::ToolTipRole);
         }
         const auto previous_index=saved_studies_->findData(previous_id);
         if(previous_index>=0) saved_studies_->setCurrentIndex(previous_index);
@@ -2641,16 +2661,20 @@ private:
         dialog.exec();
     }
 
-    void show_momentum_analysis(std::optional<MomentumStudyPreset> preset=std::nullopt) {
+    void show_momentum_analysis(std::optional<MomentumStudyPreset> preset=std::nullopt,
+        options::analysis::VerticalSpreadDirection direction=
+            options::analysis::VerticalSpreadDirection::bullish) {
+        if(preset) direction=preset->direction;
+        const auto strategy_name=vertical_spread_name(direction);
         const auto symbol=stock_symbol_->currentText();
         if(symbol.isEmpty() || !available_start_.isValid() || !available_end_.isValid()) {
-            QMessageBox::information(this,"Momentum Analysis",
+            QMessageBox::information(this,strategy_name+" Analysis",
                 "Select a symbol with stored one-minute bars first.");
             return;
         }
 
         QDialog dialog(this);
-        dialog.setWindowTitle("Momentum Analysis — "+symbol);
+        dialog.setWindowTitle(strategy_name+" Analysis — "+symbol);
         dialog.setWindowFlag(Qt::WindowMaximizeButtonHint,true);
         dialog.setSizeGripEnabled(true);
         dialog.setSizePolicy(QSizePolicy::Expanding,QSizePolicy::Expanding);
@@ -2661,14 +2685,34 @@ private:
                       qMin(qMax(760,available_size.height()*4/5),available_size.height()-40));
         auto* layout=new QVBoxLayout(&dialog);
         layout->setSizeConstraint(QLayout::SetNoConstraint);
+        auto* analysis_splitter=new QSplitter(Qt::Vertical);
+        analysis_splitter->setChildrenCollapsible(false);
+        analysis_splitter->setHandleWidth(8);
+        analysis_splitter->setOpaqueResize(true);
+        analysis_splitter->setStyleSheet(
+            "QSplitter::handle:vertical { background: palette(mid); margin: 2px 0; }");
+        auto* settings_content=new QWidget;
+        auto* settings_layout=new QVBoxLayout(settings_content);
+        settings_layout->setContentsMargins(0,0,0,0);
+        auto* settings_scroll=new QScrollArea;
+        settings_scroll->setWidget(settings_content);
+        settings_scroll->setWidgetResizable(true);
+        settings_scroll->setFrameShape(QFrame::NoFrame);
+        settings_scroll->setMinimumHeight(120);
+        analysis_splitter->addWidget(settings_scroll);
+        const QString direction_description=
+            direction==options::analysis::VerticalSpreadDirection::bullish
+                ? "A comparison is a win when the later price finishes above the bullish boundary. "
+                : "A comparison is a win when the later price finishes below the bearish boundary. ";
         auto* description=new QLabel(
-            "For each eligible aggregated-bar price q, this compares the price at the first stored bar "
+            QString("For each eligible aggregated-bar price q, this compares the price at the first stored bar "
             "at or after q's timestamp plus x calendar days. The skip window d controls when the next q "
             "becomes eligible. Results are averaged across all d possible start phases. Optional "
-            "strike adjustment compares r with a strike-grid price derived from q instead of q itself. "
+            "strike adjustment compares r with a strike-grid price derived from q instead of q itself. ")+
+            direction_description+
             "The data resolution and OHLC/VWAP analysis field are selectable below.");
         description->setWordWrap(true);
-        layout->addWidget(description);
+        settings_layout->addWidget(description);
 
         auto* controls_widget=new QWidget;
         auto* controls=new QFormLayout(controls_widget);
@@ -2774,7 +2818,7 @@ private:
         controls->addRow("Sell slippage",sell_slippage);
         controls->addRow("Analysis start",analysis_start);
         controls->addRow("Analysis end",analysis_end);
-        layout->addWidget(controls_widget);
+        settings_layout->addWidget(controls_widget);
 
         auto* parameter_ranges=new QWidget;
         auto* range_controls=new QFormLayout(parameter_ranges);
@@ -2811,7 +2855,7 @@ private:
         range_controls->addRow("Strike offset",strike_range_row);
         strike_range_row->setVisible(false);
         parameter_ranges->setVisible(false);
-        layout->addWidget(parameter_ranges);
+        settings_layout->addWidget(parameter_ranges);
 
         auto* pricing_editor=new PricingEditor;
         auto* pricing_scroll=new QScrollArea;
@@ -2821,7 +2865,7 @@ private:
         pricing_scroll->setMinimumHeight(180);
         pricing_scroll->setMaximumHeight(320);
         pricing_scroll->setVisible(false);
-        layout->addWidget(pricing_scroll);
+        settings_layout->addWidget(pricing_scroll);
 
         auto* single_results=new QWidget;
         auto* results=new QFormLayout(single_results);
@@ -2837,7 +2881,8 @@ private:
         results->addRow("Average ties per start",ties);
         results->addRow("Average comparisons per start",comparisons);
         results->addRow("Average dropped per start",dropped);
-        layout->addWidget(single_results);
+        settings_layout->addWidget(single_results);
+        settings_layout->addStretch();
 
         std::vector<MomentumStudyRow> study_rows;
         auto* study_table=new QTableView;
@@ -2855,8 +2900,17 @@ private:
         study_table->setColumnHidden(9,true);
         study_table->setColumnHidden(10,true);
         study_table->setColumnHidden(11,true);
+        study_table->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
         study_table->setVisible(false);
-        layout->addWidget(study_table,1);
+        analysis_splitter->addWidget(study_table);
+        analysis_splitter->setCollapsible(0,false);
+        analysis_splitter->setCollapsible(1,true);
+        analysis_splitter->setStretchFactor(0,3);
+        analysis_splitter->setStretchFactor(1,2);
+        analysis_splitter->setSizes({480,320});
+        analysis_splitter->handle(1)->setToolTip(
+            "Drag up or down to resize the study results table");
+        layout->addWidget(analysis_splitter,1);
 
         auto* analysis_status=new QLabel;
         analysis_status->setWordWrap(true);
@@ -2992,7 +3046,7 @@ private:
                 analysis_activity->setVisible(true);
                 analysis_status->setText("Generating the selected row's median-scenario trade ledger…");
                 ledger_watcher->setFuture(QtConcurrent::run(
-                    [bars=analyzed_bars,value,title,index=static_cast<std::size_t>(index)]() mutable {
+                    [bars=analyzed_bars,value,title,index=static_cast<std::size_t>(index),direction]() mutable {
                         MomentumLedgerOutput output;
                         output.row_index=index;
                         output.title=title;
@@ -3001,7 +3055,7 @@ private:
                             output.result=options::analysis::analyze_momentum_drop_scenarios(
                                 bars,static_cast<std::size_t>(value.window_days),
                                 static_cast<std::size_t>(value.skip_days),value.strike_adjustment,
-                                value.simulated_pricing,value.drop_rate,5,true);
+                                value.simulated_pricing,value.drop_rate,5,true,true,direction);
                         } catch(const std::exception& error) {
                             output.error=QString::fromUtf8(error.what());
                         }
@@ -3171,18 +3225,19 @@ private:
             parametric->setChecked(preset->parametric);
             strike_enabled->setChecked(preset->strike_enabled);
             simulated_pricing->setChecked(preset->strike_enabled && preset->simulated_pricing);
-            dialog.setWindowTitle("Momentum Analysis — "+symbol+" — "+preset->name);
+            dialog.setWindowTitle(strategy_name+" Analysis — "+symbol+" — "+preset->name);
             analysis_status->setText("Loaded study \""+preset->name+"\". Adjust any parameters, then select Run.");
         }
         connect(analysis_symbol,&QComboBox::currentTextChanged,&dialog,
             [&,analysis_symbol](const QString& selected_symbol) {
-                dialog.setWindowTitle("Momentum Analysis — "+selected_symbol+
+                dialog.setWindowTitle(strategy_name+" Analysis — "+selected_symbol+
                     (loaded_study_name.isEmpty() ? QString() : " — "+loaded_study_name));
             });
 
         const auto capture_preset=[&](const QString& name,const QString& id) {
             MomentumStudyPreset value;
             value.id=id;
+            value.direction=direction;
             value.name=name;
             value.symbol=analysis_symbol->currentText();
             value.parametric=parametric->isChecked();
@@ -3214,7 +3269,8 @@ private:
 
         connect(save_button,&QPushButton::clicked,&dialog,[&] {
             bool accepted=false;
-            const auto proposed=QInputDialog::getText(&dialog,"Save Momentum Study","Study name:",
+            const auto proposed=QInputDialog::getText(
+                &dialog,"Save "+strategy_name+" Study","Study name:",
                 QLineEdit::Normal,loaded_study_name,&accepted).trimmed();
             if(!accepted || proposed.isEmpty()) return;
 
@@ -3226,7 +3282,8 @@ private:
             const auto studies=load_study_presets();
             const auto same_study=std::ranges::find_if(studies,[&](const auto& value) {
                 return value.name.compare(proposed,Qt::CaseInsensitive)==0 &&
-                    value.symbol.compare(selected_symbol,Qt::CaseInsensitive)==0;
+                    value.symbol.compare(selected_symbol,Qt::CaseInsensitive)==0 &&
+                    value.direction==direction;
             });
             if(same_study!=studies.end() && same_study->id!=id) {
                 if(QMessageBox::question(&dialog,"Replace Saved Study",
@@ -3248,7 +3305,7 @@ private:
             loaded_study_id=id;
             loaded_study_name=proposed;
             loaded_study_symbol=selected_symbol;
-            dialog.setWindowTitle("Momentum Analysis — "+value.symbol+" — "+proposed);
+            dialog.setWindowTitle(strategy_name+" Analysis — "+value.symbol+" — "+proposed);
             refresh_saved_studies(id);
             if(!has_matching_result) {
                 analysis_status->setText(
@@ -3527,7 +3584,7 @@ private:
                     previous_rows=std::move(study_rows);
                 }
                 analysis_watcher->setFuture(QtConcurrent::run(
-                    [bars=analyzed_bars,requests=std::move(requests),rate,load_saved,
+                    [bars=analyzed_bars,requests=std::move(requests),rate,load_saved,direction,
                      output=std::move(output),progress,analysis_workers,
                      previous_rows=std::move(previous_rows)]() mutable {
                         std::vector<MomentumStudyRow>().swap(previous_rows);
@@ -3569,7 +3626,7 @@ private:
                                                             bars,static_cast<std::size_t>(request.window_days),
                                                             static_cast<std::size_t>(request.skip_days),
                                                             request.strike_adjustment,request.simulated_pricing,
-                                                            rate,5,false,false),
+                                                            rate,5,false,false,direction),
                                                         request.strike_adjustment,request.simulated_pricing,rate};
                                                     progress->completed.fetch_add(1,std::memory_order_relaxed);
                                                 } catch(const std::exception& error) {
@@ -3596,7 +3653,7 @@ private:
                                 output.single_result=options::analysis::analyze_momentum_drop_scenarios(
                                     bars,static_cast<std::size_t>(request.window_days),
                                     static_cast<std::size_t>(request.skip_days),request.strike_adjustment,
-                                    request.simulated_pricing,rate);
+                                    request.simulated_pricing,rate,5,false,true,direction);
                                 progress->completed.store(1,std::memory_order_relaxed);
                             }
                         } catch(const std::exception& error) {

@@ -13,9 +13,9 @@ namespace options::analysis {
 
 struct MomentumResult {
     enum class TradeResult {
-        itm,
-        otm,
-        atm,
+        win,
+        loss,
+        tie,
     };
     struct TradeRecord {
         std::string start_date;
@@ -25,7 +25,7 @@ struct MomentumResult {
         double comparison_price{};
         double profit{};
         std::size_t phase{};
-        TradeResult result{TradeResult::atm};
+        TradeResult result{TradeResult::tie};
         double money_at_risk{};
     };
     double comparisons{};
@@ -58,6 +58,11 @@ struct StrikeAdjustment {
     int offset{};
 };
 
+enum class VerticalSpreadDirection {
+    bullish,
+    bearish,
+};
+
 enum class SlippageMode {
     none,
     buy,
@@ -79,13 +84,15 @@ struct SimulatedPricing {
     std::optional<StrikeAdjustment> strike_adjustment=std::nullopt,
     std::optional<SimulatedPricing> simulated_pricing=std::nullopt,
     double drop_rate_percent=0.0, std::uint64_t drop_seed=0,
-    bool collect_trades=false, bool collect_profit_curves=true);
+    bool collect_trades=false, bool collect_profit_curves=true,
+    VerticalSpreadDirection direction=VerticalSpreadDirection::bullish);
 
 [[nodiscard]] MomentumResult analyze_momentum_drop_scenarios(
     std::span<const data::Bar> bars, std::size_t window_days, std::size_t skip_days,
     std::optional<StrikeAdjustment> strike_adjustment,
     std::optional<SimulatedPricing> simulated_pricing,
     double drop_rate_percent, std::size_t scenario_count=5,
-    bool collect_trades=false, bool collect_profit_curves=true);
+    bool collect_trades=false, bool collect_profit_curves=true,
+    VerticalSpreadDirection direction=VerticalSpreadDirection::bullish);
 
 }  // namespace options::analysis
